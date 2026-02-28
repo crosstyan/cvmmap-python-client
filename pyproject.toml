@@ -45,4 +45,4 @@ testpaths = ["tests"]
 extraPaths = ["src"]
 
 [project.urls]
-Repository = "https://github.com/<your-org>/cvmmap-python-client"
+Repository = "https://github.com/crosstyan/cvmmap-python-client"
