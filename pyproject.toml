@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cvmmap-client"
+version = "0.1.0"
+description = "Python client library for cv-mmap shared-memory + ZeroMQ streams"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "cv-mmap contributors" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pyzmq>=25",
+]
+
+[project.optional-dependencies]
+tools = [
+    "click>=8.3.1",
+    "loguru>=0.7.3",
+    "opencv-python>=4.13.0.92",
+]
+test = [
+    "pytest>=8.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cvmmap"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.basedpyright]
+extraPaths = ["src"]
+
+[project.urls]
+Repository = "https://github.com/<your-org>/cvmmap-python-client"
