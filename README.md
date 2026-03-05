@@ -30,11 +30,43 @@ from cvmmap import CvMmapClient
 client = CvMmapClient("default")
 ```
 
+URI form is also supported:
+
+```python
+client = CvMmapClient("cvmmap://default")
+client = CvMmapClient("cvmmap://cam0@/run/cvmmap?namespace=zed")
+```
+
 The default conventions are:
 
 - shared memory name: `cvmmap_{name}`
 - frame topic endpoint: `ipc:///tmp/cvmmap_{name}`
 - control endpoint: `ipc:///tmp/cvmmap_{name}_control`
+
+## CVMMAP URI scheme
+
+Accepted target forms:
+
+- Plain instance name: `<instance>`
+- URI: `cvmmap://<instance>[@<prefix>][?namespace=<namespace>]`
+
+Defaults:
+
+- `prefix=/tmp`
+- `namespace=cvmmap`
+
+Mapping:
+
+- `base_name = <namespace>_<instance>`
+- frame endpoint: `ipc://<prefix>/<base_name>`
+- control endpoint: `ipc://<prefix>/<base_name>_control`
+- shared memory name: `<base_name>` (Linux path `/dev/shm/<base_name>`)
+
+Examples:
+
+- `default` -> `ipc:///tmp/cvmmap_default`, shm `cvmmap_default`
+- `cvmmap://default` -> `ipc:///tmp/cvmmap_default`, shm `cvmmap_default`
+- `cvmmap://camera0@/run/cvmmap?namespace=zed` -> `ipc:///run/cvmmap/zed_camera0`, shm `zed_camera0`
 
 ## Development notes
 
