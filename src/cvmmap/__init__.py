@@ -1,20 +1,25 @@
 from logging import getLogger
-import struct
-from struct import error as StructError
+import importlib
 from typing import (
     AsyncGenerator,
-    Optional,
     cast,
     TypedDict,
 )
 
 import numpy as np
-import zmq
-from zmq.asyncio import Context, Poller, Socket
+
+zmq = importlib.import_module("zmq")
+_zmq_asyncio = importlib.import_module("zmq.asyncio")
+Context = _zmq_asyncio.Context
+Poller = _zmq_asyncio.Poller
+Socket = _zmq_asyncio.Socket
 
 from .msg import (
     SyncMessage,
     FrameMetadata,
+    FrameMetadataV2,
+    FrameMetadataV2Header,
+    FramePlaneDescriptorV2,
     FrameInfo,
     ModuleStatusMessage,
     ControlMessageRequest,
@@ -28,10 +33,13 @@ from .msg import (
     CONTROL_RESPONSE_OK,
     MODULE_STATUS_OFFLINE,
     MODULE_STATUS_STREAM_RESET,
+    unmarshal_frame_metadata,
+    FRAME_METADATA_REGION_SIZE,
 )
 from .shm import SharedMemory
 
 NDArray = np.ndarray
+FrameMetadataAny = FrameMetadata | FrameMetadataV2
 
 # Re-export message types for convenience
 __all__ = [
@@ -40,6 +48,9 @@ __all__ = [
     "CvMmapConfig",
     "SyncMessage",
     "FrameMetadata",
+    "FrameMetadataV2",
+    "FrameMetadataV2Header",
+    "FramePlaneDescriptorV2",
     "FrameInfo",
     "ModuleStatusMessage",
     "ControlMessageRequest",
@@ -58,14 +69,14 @@ class CvMmapClient:
     _sock: Socket
     _poller: Poller
 
-    _image_buffer: Optional[NDArray] = None
-    _shm: Optional[SharedMemory] = None
+    _image_buffer: NDArray | None = None
+    _shm: SharedMemory | None = None
 
     @property
     def shm_name(self) -> str:
         """Get the shared memory name used by this client."""
         return f"cvmmap_{self._name}"
-    
+
     @property
     def zmq_addr(self) -> str:
         """Get the ZMQ address used by this client."""
@@ -133,9 +144,9 @@ class CvMmapClient:
         self._image_buffer = None
         self._shm = None
 
-    _SHM_PAYLOAD_OFFSET = 256
+    _SHM_PAYLOAD_OFFSET: int = 256
 
-    def _read_metadata(self) -> FrameMetadata:
+    def _read_metadata(self) -> FrameMetadataAny:
         """Read and decode the `FrameMetadata` structure from shared memory.
 
         The memory layout written by the C++ producer is:
@@ -151,31 +162,62 @@ class CvMmapClient:
         assert self._shm is not None, "Shared memory not attached"
         assert self._shm.buf is not None, "Shared memory buffer is None"
 
-        # Validate magic
-        magic = bytes(self._shm.buf[:CV_MMAP_MAGIC_LEN])
-        if magic != CV_MMAP_MAGIC:
-            raise RuntimeError(
-                f"Invalid CV_MMAP magic prefix in shared memory: {magic!r} (expected {CV_MMAP_MAGIC!r})"
-            )
+        metadata_raw = bytes(self._shm.buf[:FRAME_METADATA_REGION_SIZE])
+        return unmarshal_frame_metadata(metadata_raw)
 
-        start = CV_MMAP_MAGIC_LEN
-        end = start + FrameMetadata.size() - CV_MMAP_MAGIC_LEN
-        return FrameMetadata.unmarshal(bytes(self._shm.buf[start:end]))
-
-    def _read_metadata_unchecked(self) -> FrameMetadata:
+    def _read_metadata_unchecked(self) -> FrameMetadataAny:
         """
         Read and decode the `FrameMetadata` structure from shared memory directly without checking the magic
         """
         assert self._shm is not None, "Shared memory not attached"
         assert self._shm.buf is not None, "Shared memory buffer is None"
 
-        start = CV_MMAP_MAGIC_LEN
-        end = start + FrameMetadata.size() - CV_MMAP_MAGIC_LEN
-        return FrameMetadata.unmarshal(bytes(self._shm.buf[start:end]))
+        metadata_raw = bytes(self._shm.buf[:FRAME_METADATA_REGION_SIZE])
+        return unmarshal_frame_metadata(metadata_raw)
+
+    def _payload_view(self, payload_size: int) -> memoryview:
+        assert self._shm is not None, "Shared memory not attached"
+        assert self._shm.buf is not None, "Shared memory buffer is None"
+
+        if payload_size < 0:
+            raise RuntimeError(f"Invalid payload size: {payload_size}")
+
+        start = self._SHM_PAYLOAD_OFFSET
+        end = start + payload_size
+        shm_size = len(self._shm.buf)
+        if end > shm_size:
+            raise RuntimeError(
+                f"Payload range out of shared memory bounds: [{start}, {end}) exceeds shm size {shm_size}"
+            )
+        return self._shm.buf[start:end]
+
+    def left_plane(self, metadata: FrameMetadataAny) -> NDArray:
+        if isinstance(metadata, FrameMetadataV2):
+            payload = self._payload_view(metadata.header.payload_size_bytes)
+            return metadata.left_plane(payload)
+
+        payload = self._payload_view(metadata.info.buffer_size)
+
+        shape = (metadata.info.height, metadata.info.width, metadata.info.channels)
+        if self._image_buffer is not None and self._image_buffer.shape == shape:
+            return self._image_buffer
+
+        self._image_buffer = np.ndarray(
+            shape,
+            dtype=np.uint8,
+            buffer=payload,
+        )
+        return self._image_buffer
+
+    def depth_plane(self, metadata: FrameMetadataAny) -> NDArray | None:
+        if not isinstance(metadata, FrameMetadataV2):
+            return None
+        payload = self._payload_view(metadata.header.payload_size_bytes)
+        return metadata.depth_plane(payload)
 
     def _ensure_memory(self):
         """Attach to shared memory and initialize the numpy view if necessary."""
-        if self._shm is not None and self._image_buffer is not None:
+        if self._shm is not None:
             return
 
         if self._shm is None:
@@ -183,21 +225,9 @@ class CvMmapClient:
                 name=self.shm_name, create=False, track=False
             )
 
-        # Read metadata once and build numpy view if not yet created (this also validates magic)
-        meta = self._read_metadata()
-        if self._image_buffer is None:
-            assert self._shm is not None, "Shared memory not attached"
-            assert self._shm.buf is not None, "Shared memory buffer is None"
-            start = self._SHM_PAYLOAD_OFFSET
-            end = start + meta.info.buffer_size
-            mv = self._shm.buf[start:end]
-            self._image_buffer = np.ndarray(
-                (meta.info.height, meta.info.width, meta.info.channels),
-                dtype=np.uint8,
-                buffer=mv,
-            )
+        self._read_metadata()
 
-    async def __aiter__(self) -> AsyncGenerator[tuple[NDArray, FrameMetadata], None]:
+    async def __aiter__(self) -> AsyncGenerator[tuple[NDArray, FrameMetadataAny], None]:
         """
         Asynchronous generator that yields numpy array of image.
 
@@ -245,7 +275,6 @@ class CvMmapClient:
                         # Handle sync message (frame notification)
                         sync_message = SyncMessage.unmarshal(message)
                         self._ensure_memory()
-                        assert self._image_buffer is not None
 
                         if sync_message.label != self._name:
                             raise RuntimeError(
@@ -253,7 +282,7 @@ class CvMmapClient:
                             )
 
                         metadata = self._read_metadata_unchecked()
-                        yield self._image_buffer, metadata
+                        yield self.left_plane(metadata), metadata
                     else:
                         raise RuntimeError(f"Unknown message magic: {magic:#x}")
 
@@ -261,8 +290,8 @@ class CvMmapClient:
 class CvMmapConfig(TypedDict):
     name: str
     # Optional overrides for non-standard setups
-    shm_name: Optional[str]
-    zmq_addr: Optional[str]
+    shm_name: str | None
+    zmq_addr: str | None
 
 
 class CvMmapRequestClient:
@@ -281,17 +310,13 @@ class CvMmapRequestClient:
     def shm_name(self) -> str:
         """Get the shared memory name used by this client."""
         return f"cvmmap_{self._name}"
-    
+
     @property
     def zmq_addr(self) -> str:
         """Get the ZMQ address used by this client."""
         return f"ipc:///tmp/{self.shm_name}_control"
 
-
-    def __init__(
-        self,
-        name: str
-    ):
+    def __init__(self, name: str):
         """Create a CvMmapRequestClient.
 
         Parameters
