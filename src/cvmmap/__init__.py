@@ -1,9 +1,11 @@
 from logging import getLogger
 import importlib
+import re
 from typing import (
     AsyncGenerator,
     cast,
     TypedDict,
+    NamedTuple,
 )
 
 import numpy as np
@@ -41,6 +43,100 @@ from .shm import SharedMemory
 NDArray = np.ndarray
 FrameMetadataAny = FrameMetadata | FrameMetadataV2
 
+_INSTANCE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,22})$")
+_NAMESPACE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,31})$")
+_UNIX_PATH_MAX = 107
+
+
+class _ResolvedTarget(NamedTuple):
+    instance: str
+    namespace: str
+    prefix: str
+    base_name: str
+
+
+def _validate_prefix(prefix: str) -> str:
+    if not prefix.startswith("/"):
+        raise ValueError("cvmmap uri prefix must be an absolute path")
+    if "\\" in prefix or "\x00" in prefix:
+        raise ValueError("cvmmap uri prefix contains invalid characters")
+    if "//" in prefix:
+        raise ValueError("cvmmap uri prefix must not contain empty path segments")
+
+    normalized = prefix if prefix == "/" else prefix.rstrip("/")
+    for segment in normalized.split("/"):
+        if segment in {".", ".."}:
+            raise ValueError("cvmmap uri prefix must not contain traversal segments")
+    return normalized
+
+
+def _resolve_target(name_or_uri: str) -> _ResolvedTarget:
+    default_namespace = "cvmmap"
+    default_prefix = "/tmp"
+
+    if name_or_uri.startswith("cvmmap://"):
+        body = name_or_uri[len("cvmmap://") :]
+        authority, sep, query = body.partition("?")
+        if sep and not query:
+            raise ValueError("cvmmap uri query string is empty")
+        if "@" in authority:
+            if authority.count("@") != 1:
+                raise ValueError("cvmmap uri authority must contain at most one '@'")
+            instance, prefix = authority.split("@", 1)
+            if not prefix:
+                raise ValueError("cvmmap uri prefix is empty")
+        else:
+            instance = authority
+            prefix = default_prefix
+
+        namespace = default_namespace
+        if query:
+            parts = query.split("&")
+            if any(not part for part in parts):
+                raise ValueError("cvmmap uri query contains empty key/value")
+            for part in parts:
+                key, eq, value = part.partition("=")
+                if not eq:
+                    raise ValueError("cvmmap uri query must be key=value pairs")
+                if key != "namespace":
+                    raise ValueError(f"unsupported cvmmap uri query key: {key}")
+                if not value:
+                    raise ValueError("cvmmap uri namespace is empty")
+                namespace = value
+    else:
+        instance = name_or_uri
+        prefix = default_prefix
+        namespace = default_namespace
+        if any(ch in instance for ch in ("@", "?", "/")):
+            raise ValueError(
+                "plain cvmmap instance names must not contain '@', '?', or '/'"
+            )
+
+    if not _INSTANCE_RE.fullmatch(instance):
+        raise ValueError(
+            "invalid cvmmap instance; expected [A-Za-z0-9][A-Za-z0-9._-]{0,22}"
+        )
+    if not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(
+            "invalid cvmmap namespace; expected [A-Za-z0-9][A-Za-z0-9._-]{0,31}"
+        )
+
+    normalized_prefix = _validate_prefix(prefix)
+    base_name = f"{namespace}_{instance}"
+    control_suffix = f"{normalized_prefix}/{base_name}_control"
+    if len(control_suffix) > _UNIX_PATH_MAX:
+        raise ValueError(
+            f"cvmmap ipc path too long ({len(control_suffix)}>{_UNIX_PATH_MAX})"
+        )
+
+    return _ResolvedTarget(
+        instance=instance,
+        namespace=namespace,
+        prefix=normalized_prefix,
+        base_name=base_name,
+    )
+
+
 # Re-export message types for convenience
 __all__ = [
     "CvMmapClient",
@@ -64,6 +160,9 @@ class CvMmapClient:
     """
 
     _name: str
+    _prefix: str
+    _namespace: str
+    _base_name: str
 
     _ctx: Context
     _sock: Socket
@@ -75,12 +174,12 @@ class CvMmapClient:
     @property
     def shm_name(self) -> str:
         """Get the shared memory name used by this client."""
-        return f"cvmmap_{self._name}"
+        return self._base_name
 
     @property
     def zmq_addr(self) -> str:
         """Get the ZMQ address used by this client."""
-        return f"ipc:///tmp/{self.shm_name}"
+        return f"ipc://{self._prefix}/{self.shm_name}"
 
     def _subscribe(self):
         """
@@ -118,19 +217,22 @@ class CvMmapClient:
 
     def __init__(
         self,
-        name: str,
+        name_or_uri: str,
     ):
         """Create a CvMmapClient.
 
         Parameters
         ----------
-        name
-            Base name of the video source (e.g. "default"). The shared-memory
-            segment is assumed to be ``cvmmap_{name}`` and the ZMQ publisher
-            address ``ipc:///tmp/{shm_name}`` by convention.
+        name_or_uri
+            Either a plain instance name (e.g. ``default``) or URI form
+            ``cvmmap://<instance>[@<prefix>][?namespace=<namespace>]``.
         """
 
-        self._name = name
+        resolved = _resolve_target(name_or_uri)
+        self._name = resolved.instance
+        self._prefix = resolved.prefix
+        self._namespace = resolved.namespace
+        self._base_name = resolved.base_name
 
         self._ctx = Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
@@ -302,6 +404,9 @@ class CvMmapRequestClient:
     """
 
     _name: str
+    _prefix: str
+    _namespace: str
+    _base_name: str
 
     _ctx: Context
     _sock: Socket
@@ -309,26 +414,27 @@ class CvMmapRequestClient:
     @property
     def shm_name(self) -> str:
         """Get the shared memory name used by this client."""
-        return f"cvmmap_{self._name}"
+        return self._base_name
 
     @property
     def zmq_addr(self) -> str:
         """Get the ZMQ address used by this client."""
-        return f"ipc:///tmp/{self.shm_name}_control"
+        return f"ipc://{self._prefix}/{self.shm_name}_control"
 
-    def __init__(self, name: str):
+    def __init__(self, name_or_uri: str):
         """Create a CvMmapRequestClient.
 
         Parameters
         ----------
-        name
-            Base name of the video source (e.g. "default"). Used as the label
-            in control messages.
-        zmq_addr
-            Optional ZMQ REQ socket address. If not provided, defaults to
-            ``ipc:///tmp/cvmmap_{name}_control`` by convention.
+        name_or_uri
+            Either a plain instance name (e.g. ``default``) or URI form
+            ``cvmmap://<instance>[@<prefix>][?namespace=<namespace>]``.
         """
-        self._name = name
+        resolved = _resolve_target(name_or_uri)
+        self._name = resolved.instance
+        self._prefix = resolved.prefix
+        self._namespace = resolved.namespace
+        self._base_name = resolved.base_name
 
         self._ctx = Context.instance()
         self._sock = self._ctx.socket(zmq.REQ)

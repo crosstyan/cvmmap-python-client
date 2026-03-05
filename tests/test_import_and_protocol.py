@@ -121,3 +121,24 @@ def test_v2_malformed_descriptor_rejected() -> None:
         assert "out of bounds" in str(exc)
     else:
         raise AssertionError("Expected malformed v2 descriptor to be rejected")
+
+
+def test_uri_target_defaults() -> None:
+    client = cvmmap.CvMmapClient("cvmmap://example")
+    assert client.shm_name == "cvmmap_example"
+    assert client.zmq_addr == "ipc:///tmp/cvmmap_example"
+
+
+def test_uri_target_custom_prefix_namespace() -> None:
+    client = cvmmap.CvMmapClient("cvmmap://camera0@/run/cvmmap?namespace=zed")
+    assert client.shm_name == "zed_camera0"
+    assert client.zmq_addr == "ipc:///run/cvmmap/zed_camera0"
+
+
+def test_plain_name_rejects_uri_chars() -> None:
+    try:
+        _ = cvmmap.CvMmapClient("bad/name")
+    except ValueError as exc:
+        assert "plain cvmmap instance names" in str(exc)
+    else:
+        raise AssertionError("Expected plain name with slash to be rejected")
