@@ -103,9 +103,9 @@ During the migration window, the producer may emit SHM v2 metadata while maintai
 2. Then deploy producer-only-v2 builds.
 3. Never deploy producer-v2 before consumers are ready.
 
-### Frame iteration with depth
+### Frame iteration with depth and confidence
 
-When consuming v2 streams with depth planes:
+When consuming v2 streams with additional v2 planes:
 
 ```python
 from cvmmap import CvMmapClient
@@ -113,10 +113,14 @@ from cvmmap import CvMmapClient
 client = CvMmapClient("default")
 async for image, metadata in client:
     # image is always the left plane (backward compatible)
-    # access depth via client helper when available
+    # access optional extra planes via client helpers when available
     depth = client.depth_plane(metadata)
+    confidence = client.confidence_plane(metadata)
     if depth is not None:
         # process depth plane
+        pass
+    if confidence is not None:
+        # process confidence plane
         pass
 ```
 

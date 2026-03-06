@@ -33,6 +33,11 @@ def _load_core_uri_fixture() -> dict:
     return json.loads(CORE_FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
+class _FakeSharedMemory:
+    def __init__(self, data: bytes) -> None:
+        self.buf = memoryview(data)
+
+
 def test_import_core_symbols() -> None:
     assert getattr(cvmmap, "CvMmapClient") is not None
     assert getattr(cvmmap, "FrameInfo") is not None
@@ -101,6 +106,7 @@ def test_v2_left_only_parse_pass() -> None:
     assert left[0, 0].tolist() == [1, 2, 3]
     assert left[1, 1].tolist() == [10, 11, 12]
     assert metadata.depth_plane(left_payload) is None
+    assert metadata.confidence_plane(left_payload) is None
 
 
 def test_v2_left_depth_parse_pass() -> None:
@@ -126,6 +132,48 @@ def test_v2_left_depth_parse_pass() -> None:
     assert np.isclose(depth[0, 1], 2.5)
     assert np.isclose(depth[1, 0], 3.5)
     assert np.isclose(depth[1, 1], 4.5)
+    assert metadata.confidence_plane(payload) is None
+
+
+def test_v2_left_depth_confidence_parse_pass() -> None:
+    payload = _load_fixture_bytes("v2_left_depth_confidence_valid_payload.hex")
+    metadata = cvmmap_msg.unmarshal_frame_metadata(
+        _load_fixture_bytes("v2_left_depth_confidence_valid_metadata.hex")
+    )
+
+    assert isinstance(metadata, cvmmap.FrameMetadataV2)
+    assert metadata.confidence_descriptor is not None
+
+    confidence = metadata.confidence_plane(payload)
+    assert confidence is not None
+    assert confidence.shape == (2, 2)
+    assert confidence.dtype == np.uint8
+    assert confidence.strides == (2, 1)
+    assert confidence.tolist() == [[10, 20], [30, 40]]
+
+
+def test_client_confidence_plane_helper() -> None:
+    client = cvmmap.CvMmapClient("example")
+
+    try:
+        metadata_region = _load_fixture_bytes("v2_left_depth_valid_metadata.hex")
+        payload = _load_fixture_bytes("v2_left_depth_valid_payload.hex")
+        client._shm = _FakeSharedMemory(metadata_region + payload)
+        metadata = client._read_metadata()
+        assert client.confidence_plane(metadata) is None
+
+        metadata_region = _load_fixture_bytes(
+            "v2_left_depth_confidence_valid_metadata.hex"
+        )
+        payload = _load_fixture_bytes("v2_left_depth_confidence_valid_payload.hex")
+        client._shm = _FakeSharedMemory(metadata_region + payload)
+        metadata = client._read_metadata()
+        confidence = client.confidence_plane(metadata)
+
+        assert confidence is not None
+        assert confidence.tolist() == [[10, 20], [30, 40]]
+    finally:
+        client._sock.close()
 
 
 def test_v2_malformed_descriptor_rejected() -> None:

@@ -37,6 +37,7 @@ FRAME_METADATA_V2_MAJOR = 2
 
 FRAME_PLANE_TYPE_LEFT = 0
 FRAME_PLANE_TYPE_DEPTH = 1
+FRAME_PLANE_TYPE_CONFIDENCE = 2
 
 PIXEL_FORMAT_RGB = 0
 PIXEL_FORMAT_BGR = 1
@@ -935,6 +936,12 @@ class FrameMetadataV2:
         return self.descriptors[1]
 
     @property
+    def confidence_descriptor(self) -> Optional[FramePlaneDescriptorV2]:
+        if self.header.plane_count < 3:
+            return None
+        return self.descriptors[2]
+
+    @property
     def active_descriptors(self) -> tuple[FramePlaneDescriptorV2, ...]:
         return self.descriptors[: self.header.plane_count]
 
@@ -967,6 +974,13 @@ class FrameMetadataV2:
                     f"v2 descriptor slot 1 must be DEPTH plane ({FRAME_PLANE_TYPE_DEPTH}), got {self.descriptors[1].plane_type}"
                 )
 
+        if self.header.plane_count >= 3:
+            if self.descriptors[2].plane_type != FRAME_PLANE_TYPE_CONFIDENCE:
+                raise ValueError(
+                    "v2 descriptor slot 2 must be CONFIDENCE plane "
+                    f"({FRAME_PLANE_TYPE_CONFIDENCE}), got {self.descriptors[2].plane_type}"
+                )
+
         for slot in range(1, self.header.plane_count):
             prev = self.descriptors[slot - 1]
             curr = self.descriptors[slot]
@@ -995,6 +1009,13 @@ class FrameMetadataV2:
         if self.header.plane_count < 2:
             return None
         return self.plane(1, payload)
+
+    def confidence_plane(
+        self, payload: memoryview | bytes | bytearray
+    ) -> Optional[np.ndarray]:
+        if self.header.plane_count < 3:
+            return None
+        return self.plane(2, payload)
 
     @staticmethod
     def unmarshal(data: bytes) -> "FrameMetadataV2":

@@ -334,6 +334,12 @@ class CvMmapClient:
         payload = self._payload_view(metadata.header.payload_size_bytes)
         return metadata.depth_plane(payload)
 
+    def confidence_plane(self, metadata: FrameMetadataAny) -> NDArray | None:
+        if not isinstance(metadata, FrameMetadataV2):
+            return None
+        payload = self._payload_view(metadata.header.payload_size_bytes)
+        return metadata.confidence_plane(payload)
+
     def _ensure_memory(self):
         """Attach to shared memory and initialize the numpy view if necessary."""
         if self._shm is not None:
