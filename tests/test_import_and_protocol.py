@@ -1,4 +1,6 @@
 from importlib import import_module
+import json
+import os
 from pathlib import Path
 import sys
 
@@ -11,10 +13,23 @@ cvmmap_msg = import_module("cvmmap.msg")
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "protocol"
+CORE_FIXTURE_PATH = Path(
+    os.environ.get(
+        "CVMMAP_CORE_URI_FIXTURE",
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "cvmmap_core"
+        / "uri_targets.json",
+    )
+)
 
 
 def _load_fixture_bytes(filename: str) -> bytes:
     return bytes.fromhex((FIXTURE_DIR / filename).read_text(encoding="utf-8"))
+
+
+def _load_core_uri_fixture() -> dict:
+    return json.loads(CORE_FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 def test_import_core_symbols() -> None:
@@ -142,3 +157,26 @@ def test_plain_name_rejects_uri_chars() -> None:
         assert "plain cvmmap instance names" in str(exc)
     else:
         raise AssertionError("Expected plain name with slash to be rejected")
+
+
+def test_uri_fixture_conformance() -> None:
+    fixture = _load_core_uri_fixture()
+
+    for case in fixture["cases"]:
+        client = cvmmap.CvMmapClient(case["input"])
+        assert client._name == case["instance"]
+        assert client._namespace == case["namespace"]
+        assert client._prefix == case["prefix"]
+        assert client._base_name == case["base_name"]
+        assert client.shm_name == case["shm_name"]
+        assert client.zmq_addr == case["zmq_addr"]
+
+    for case in fixture["invalid_cases"]:
+        try:
+            _ = cvmmap.CvMmapClient(case["input"])
+        except ValueError as exc:
+            assert case["error_contains"] in str(exc)
+        else:
+            raise AssertionError(
+                f"Expected invalid URI fixture to fail: {case['input']}"
+            )
