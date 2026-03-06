@@ -324,7 +324,7 @@ class CvMmapClient:
 
         if self._shm is None:
             self._shm = SharedMemory(  # pylint: disable=unexpected-keyword-arg
-                name=self.shm_name, create=False, track=False
+                name=self.shm_name, create=False, track=False, readonly=True
             )
 
         self._read_metadata()
