@@ -2,6 +2,7 @@ from importlib import import_module
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 
 import numpy as np
@@ -54,6 +55,8 @@ def test_protocol_struct_sizes() -> None:
 
     assert sync_message_type.size() == 48
     assert frame_info_type.size() == 12
+    assert cvmmap.BodyTrackingMessageHeader.size() == 64
+    assert cvmmap.BodyTrack.size() == 3248
     assert cvmmap.FrameMetadataV2Header.size() == 64
     assert cvmmap.FramePlaneDescriptorV2.size() == 24
     assert cvmmap.FrameMetadataV2.size() == 256
@@ -142,12 +145,14 @@ def test_uri_target_defaults() -> None:
     client = cvmmap.CvMmapClient("cvmmap://example")
     assert client.shm_name == "cvmmap_example"
     assert client.zmq_addr == "ipc:///tmp/cvmmap_example"
+    assert client.zmq_body_addr == "ipc:///tmp/cvmmap_example_body"
 
 
 def test_uri_target_custom_prefix_namespace() -> None:
     client = cvmmap.CvMmapClient("cvmmap://camera0@/run/cvmmap?namespace=zed")
     assert client.shm_name == "zed_camera0"
     assert client.zmq_addr == "ipc:///run/cvmmap/zed_camera0"
+    assert client.zmq_body_addr == "ipc:///run/cvmmap/zed_camera0_body"
 
 
 def test_plain_name_rejects_uri_chars() -> None:
@@ -170,6 +175,7 @@ def test_uri_fixture_conformance() -> None:
         assert client._base_name == case["base_name"]
         assert client.shm_name == case["shm_name"]
         assert client.zmq_addr == case["zmq_addr"]
+        assert client.zmq_body_addr == case["zmq_body_addr"]
 
     for case in fixture["invalid_cases"]:
         try:
@@ -180,3 +186,110 @@ def test_uri_fixture_conformance() -> None:
             raise AssertionError(
                 f"Expected invalid URI fixture to fail: {case['input']}"
             )
+
+
+def test_body_tracking_message_parse_pass() -> None:
+    header_fmt = cvmmap.BodyTrackingMessageHeader.PACK_FMT
+    record_size = cvmmap.BodyTrack.size()
+    label = b"example".ljust(24, b"\0")
+
+    body_record = bytearray(record_size)
+    struct.pack_into("<iBB", body_record, 0, 7, 1, 0)
+    struct.pack_into("<f", body_record, 8, 88.5)
+    struct.pack_into("<3f", body_record, 12, 1.0, 2.0, 3.0)
+    struct.pack_into("<H", body_record, record_size - 4, 1)
+    struct.pack_into("<H", body_record, record_size - 2, 2)
+
+    payload = bytes(body_record)
+    header = struct.pack(
+        header_fmt,
+        cvmmap_msg.BODY_TRACKING_MAGIC,
+        0,
+        cvmmap_msg.VERSION_MAJOR,
+        cvmmap_msg.VERSION_MINOR,
+        42,
+        1000,
+        2000,
+        1,
+        record_size,
+        0,
+        0,
+        2,
+        0,
+        1,
+        0,
+        len(payload),
+        label,
+    )
+
+    frame = cvmmap_msg.unmarshal_body_tracking_message(header + payload)
+    assert frame.frame_count == 42
+    assert frame.header.body_count == 1
+    assert frame.label == "example"
+    assert len(frame.bodies) == 1
+    assert frame.bodies[0].id == 7
+    assert np.allclose(frame.bodies[0].position, np.array([1.0, 2.0, 3.0]))
+    assert frame.bodies[0].keypoint_count == 1
+    assert frame.bodies[0].flags == 2
+
+
+def test_body_tracking_message_invalid_record_size_rejected() -> None:
+    header = struct.pack(
+        cvmmap.BodyTrackingMessageHeader.PACK_FMT,
+        cvmmap_msg.BODY_TRACKING_MAGIC,
+        0,
+        cvmmap_msg.VERSION_MAJOR,
+        cvmmap_msg.VERSION_MINOR,
+        1,
+        100,
+        200,
+        1,
+        12,
+        cvmmap_msg.BODY_FORMAT_BODY_18,
+        cvmmap_msg.BODY_KEYPOINT_SELECTION_FULL,
+        cvmmap_msg.BODY_TRACKING_MODEL_HUMAN_BODY_ACCURATE,
+        cvmmap_msg.INFERENCE_PRECISION_FP32,
+        0,
+        0,
+        12,
+        b"example".ljust(24, b"\0"),
+    )
+
+    try:
+        cvmmap_msg.unmarshal_body_tracking_message(header + (b"\0" * 12))
+    except ValueError as exc:
+        assert "body_record_size" in str(exc)
+    else:
+        raise AssertionError("Expected invalid body record size to be rejected")
+
+
+def test_body_tracking_message_invalid_payload_size_rejected() -> None:
+    header = struct.pack(
+        cvmmap.BodyTrackingMessageHeader.PACK_FMT,
+        cvmmap_msg.BODY_TRACKING_MAGIC,
+        0,
+        cvmmap_msg.VERSION_MAJOR,
+        cvmmap_msg.VERSION_MINOR,
+        1,
+        100,
+        200,
+        1,
+        cvmmap_msg.BODY_TRACKING_BODY_RECORD_SIZE,
+        cvmmap_msg.BODY_FORMAT_BODY_18,
+        cvmmap_msg.BODY_KEYPOINT_SELECTION_FULL,
+        cvmmap_msg.BODY_TRACKING_MODEL_HUMAN_BODY_ACCURATE,
+        cvmmap_msg.INFERENCE_PRECISION_FP32,
+        0,
+        0,
+        12,
+        b"example".ljust(24, b"\0"),
+    )
+
+    try:
+        cvmmap_msg.unmarshal_body_tracking_message(
+            header + (b"\0" * cvmmap_msg.BODY_TRACKING_BODY_RECORD_SIZE)
+        )
+    except ValueError as exc:
+        assert "payload_size_bytes" in str(exc)
+    else:
+        raise AssertionError("Expected invalid payload size to be rejected")

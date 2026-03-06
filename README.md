@@ -41,6 +41,7 @@ The default conventions are:
 
 - shared memory name: `cvmmap_{name}`
 - frame topic endpoint: `ipc:///tmp/cvmmap_{name}`
+- body topic endpoint: `ipc:///tmp/cvmmap_{name}_body`
 - control endpoint: `ipc:///tmp/cvmmap_{name}_control`
 
 ## CVMMAP URI scheme
@@ -59,6 +60,7 @@ Mapping:
 
 - `base_name = <namespace>_<instance>`
 - frame endpoint: `ipc://<prefix>/<base_name>`
+- body endpoint: `ipc://<prefix>/<base_name>_body`
 - control endpoint: `ipc://<prefix>/<base_name>_control`
 - shared memory name: `<base_name>` (Linux path `/dev/shm/<base_name>`)
 
@@ -119,3 +121,17 @@ async for image, metadata in client:
 ```
 
 See the producer's `docs/abi_v2_migration_guide.md` for full specifications.
+
+### Body tracking substream
+
+Body tracking is published on a separate PUB/SUB socket and does not change the
+existing frame iterator:
+
+```python
+from cvmmap import CvMmapClient
+
+client = CvMmapClient("default")
+async for body_frame in client.body_stream():
+    for body in body_frame.bodies:
+        print(body.id, body.position)
+```

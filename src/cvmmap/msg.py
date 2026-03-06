@@ -12,6 +12,7 @@ MODULE_STATUS_MAGIC = 0x5A
 
 CONTROL_MESSAGE_REQUEST_MAGIC = 0x3C
 CONTROL_MESSAGE_RESPONSE_MAGIC = 0x3D
+BODY_TRACKING_MAGIC = 0x62
 
 CONTROL_MSG_CMD_GENERIC = 0
 CONTROL_MSG_CMD_RESET_FRAME_COUNT = 0x1001
@@ -59,6 +60,42 @@ CV_MMAP_MAGIC: bytes = b"CV-MMAP\0"
 CV_MMAP_MAGIC_LEN: int = len(CV_MMAP_MAGIC)
 
 FRAME_METADATA_REGION_SIZE = 256
+BODY_KEYPOINT_CAPACITY = 38
+BODY_BOX2D_POINTS = 4
+BODY_BOX3D_POINTS = 8
+BODY_TRACKING_HEADER_SIZE = 64
+BODY_TRACKING_BODY_RECORD_SIZE = 3248
+
+BODY_FORMAT_BODY_18 = 0
+BODY_FORMAT_BODY_34 = 1
+BODY_FORMAT_BODY_38 = 2
+
+BODY_KEYPOINT_SELECTION_FULL = 0
+BODY_KEYPOINT_SELECTION_UPPER_BODY = 1
+
+BODY_TRACKING_MODEL_HUMAN_BODY_FAST = 0
+BODY_TRACKING_MODEL_HUMAN_BODY_MEDIUM = 1
+BODY_TRACKING_MODEL_HUMAN_BODY_ACCURATE = 2
+
+INFERENCE_PRECISION_FP32 = 0
+INFERENCE_PRECISION_FP16 = 1
+INFERENCE_PRECISION_INT8 = 2
+
+OBJECT_TRACKING_STATE_OFF = 0
+OBJECT_TRACKING_STATE_OK = 1
+OBJECT_TRACKING_STATE_SEARCHING = 2
+OBJECT_TRACKING_STATE_TERMINATE = 3
+
+OBJECT_ACTION_STATE_IDLE = 0
+OBJECT_ACTION_STATE_MOVING = 1
+
+BODY_TRACKING_FLAG_IS_NEW = 0x0001
+BODY_TRACKING_FLAG_IS_TRACKED = 0x0002
+BODY_TRACKING_FLAG_BODY_FITTING_ENABLED = 0x0004
+BODY_TRACKING_FLAG_REDUCED_PRECISION_REQUESTED = 0x0008
+
+BODY_TRACKING_BODY_FLAG_HAS_LOCAL_JOINTS = 0x0001
+BODY_TRACKING_BODY_FLAG_HAS_ROOT_ORIENTATION = 0x0002
 
 _PIXEL_FORMAT_CHANNELS: dict[int, int] = {
     PIXEL_FORMAT_RGB: 3,
@@ -159,6 +196,273 @@ class SyncMessage:
         return SyncMessage(
             frame_count=frame_count, timestamp_ns=timestamp_ns, label=label
         )
+
+
+@dataclass
+class BodyTrackingMessageHeader:
+    frame_count: int
+    timestamp_ns: int
+    sdk_timestamp_ns: int
+    body_count: int
+    body_record_size: int
+    body_format: int
+    body_selection: int
+    detection_model: int
+    inference_precision: int
+    flags: int
+    payload_size_bytes: int
+    label: str
+
+    PACK_FMT = f"<BBBBIQQHHBBBBHHI{LABEL_LEN_MAX}s"
+
+    @staticmethod
+    def size() -> int:
+        return struct.calcsize(BodyTrackingMessageHeader.PACK_FMT)
+
+    @staticmethod
+    def unmarshal(data: bytes) -> "BodyTrackingMessageHeader":
+        if len(data) < BodyTrackingMessageHeader.size():
+            raise ValueError(
+                "Body tracking header too short: "
+                f"{len(data)} < {BodyTrackingMessageHeader.size()}"
+            )
+
+        (
+            magic,
+            _reserved_0,
+            versions_major,
+            versions_minor,
+            frame_count,
+            timestamp_ns,
+            sdk_timestamp_ns,
+            body_count,
+            body_record_size,
+            body_format,
+            body_selection,
+            detection_model,
+            inference_precision,
+            flags,
+            _reserved_1,
+            payload_size_bytes,
+            label_bytes,
+        ) = struct.unpack(
+            BodyTrackingMessageHeader.PACK_FMT,
+            data[: BodyTrackingMessageHeader.size()],
+        )
+
+        if magic != BODY_TRACKING_MAGIC:
+            raise ValueError(
+                "Invalid body tracking magic: "
+                f"expected {BODY_TRACKING_MAGIC:#x}, got {magic:#x}"
+            )
+        if versions_major != VERSION_MAJOR:
+            raise ValueError(
+                "Unsupported body tracking major version: "
+                f"expected {VERSION_MAJOR}, got {versions_major}"
+            )
+        if body_record_size != BODY_TRACKING_BODY_RECORD_SIZE:
+            raise ValueError(
+                "Invalid body_record_size: "
+                f"expected {BODY_TRACKING_BODY_RECORD_SIZE}, got {body_record_size}"
+            )
+
+        expected_payload_size = body_count * BODY_TRACKING_BODY_RECORD_SIZE
+        if payload_size_bytes != expected_payload_size:
+            raise ValueError(
+                "Invalid payload_size_bytes: "
+                f"expected {expected_payload_size}, got {payload_size_bytes}"
+            )
+        if body_format > BODY_FORMAT_BODY_38:
+            raise ValueError(f"Unsupported body_format={body_format}")
+        if body_selection > BODY_KEYPOINT_SELECTION_UPPER_BODY:
+            raise ValueError(f"Unsupported body_selection={body_selection}")
+        if detection_model > BODY_TRACKING_MODEL_HUMAN_BODY_ACCURATE:
+            raise ValueError(f"Unsupported detection_model={detection_model}")
+        if inference_precision > INFERENCE_PRECISION_INT8:
+            raise ValueError(
+                f"Unsupported inference_precision={inference_precision}"
+            )
+
+        return BodyTrackingMessageHeader(
+            frame_count=frame_count,
+            timestamp_ns=timestamp_ns,
+            sdk_timestamp_ns=sdk_timestamp_ns,
+            body_count=body_count,
+            body_record_size=body_record_size,
+            body_format=body_format,
+            body_selection=body_selection,
+            detection_model=detection_model,
+            inference_precision=inference_precision,
+            flags=flags,
+            payload_size_bytes=payload_size_bytes,
+            label=label_bytes.split(b"\0", 1)[0].decode("utf-8"),
+        )
+
+
+@dataclass
+class BodyTrack:
+    id: int
+    tracking_state: int
+    action_state: int
+    confidence: float
+    position: np.ndarray
+    velocity: np.ndarray
+    position_covariance: np.ndarray
+    bounding_box_2d: np.ndarray
+    bounding_box_3d: np.ndarray
+    dimensions: np.ndarray
+    keypoint_2d: np.ndarray
+    keypoint_3d: np.ndarray
+    keypoint_confidence: np.ndarray
+    keypoint_covariance: np.ndarray
+    head_bounding_box_2d: np.ndarray
+    head_bounding_box_3d: np.ndarray
+    head_position: np.ndarray
+    local_position_per_joint: np.ndarray
+    local_orientation_per_joint: np.ndarray
+    global_root_orientation: np.ndarray
+    keypoint_count: int
+    flags: int
+
+    @staticmethod
+    def size() -> int:
+        return BODY_TRACKING_BODY_RECORD_SIZE
+
+    @staticmethod
+    def unmarshal(data: memoryview | bytes | bytearray) -> "BodyTrack":
+        chunk = memoryview(data)
+        if len(chunk) < BodyTrack.size():
+            raise ValueError(
+                f"Body track record too short: {len(chunk)} < {BodyTrack.size()}"
+            )
+
+        id_, tracking_state, action_state = struct.unpack_from("<iBB", chunk, 0)
+        confidence = struct.unpack_from("<f", chunk, 8)[0]
+
+        cursor = 12
+
+        def take_f32(count: int, shape: tuple[int, ...]) -> np.ndarray:
+            nonlocal cursor
+            size = count * 4
+            arr = np.frombuffer(chunk[cursor : cursor + size], dtype="<f4").copy()
+            cursor += size
+            return arr.reshape(shape)
+
+        position = take_f32(3, (3,))
+        velocity = take_f32(3, (3,))
+        position_covariance = take_f32(6, (6,))
+        bounding_box_2d = take_f32(8, (BODY_BOX2D_POINTS, 2))
+        bounding_box_3d = take_f32(24, (BODY_BOX3D_POINTS, 3))
+        dimensions = take_f32(3, (3,))
+        keypoint_2d = take_f32(BODY_KEYPOINT_CAPACITY * 2, (BODY_KEYPOINT_CAPACITY, 2))
+        keypoint_3d = take_f32(BODY_KEYPOINT_CAPACITY * 3, (BODY_KEYPOINT_CAPACITY, 3))
+        keypoint_confidence = take_f32(BODY_KEYPOINT_CAPACITY, (BODY_KEYPOINT_CAPACITY,))
+        keypoint_covariance = take_f32(
+            BODY_KEYPOINT_CAPACITY * 6, (BODY_KEYPOINT_CAPACITY, 6)
+        )
+        head_bounding_box_2d = take_f32(8, (BODY_BOX2D_POINTS, 2))
+        head_bounding_box_3d = take_f32(24, (BODY_BOX3D_POINTS, 3))
+        head_position = take_f32(3, (3,))
+        local_position_per_joint = take_f32(
+            BODY_KEYPOINT_CAPACITY * 3, (BODY_KEYPOINT_CAPACITY, 3)
+        )
+        local_orientation_per_joint = take_f32(
+            BODY_KEYPOINT_CAPACITY * 4, (BODY_KEYPOINT_CAPACITY, 4)
+        )
+        global_root_orientation = take_f32(4, (4,))
+        keypoint_count, body_flags = struct.unpack_from("<HH", chunk, cursor)
+
+        return BodyTrack(
+            id=id_,
+            tracking_state=tracking_state,
+            action_state=action_state,
+            confidence=confidence,
+            position=position,
+            velocity=velocity,
+            position_covariance=position_covariance,
+            bounding_box_2d=bounding_box_2d,
+            bounding_box_3d=bounding_box_3d,
+            dimensions=dimensions,
+            keypoint_2d=keypoint_2d,
+            keypoint_3d=keypoint_3d,
+            keypoint_confidence=keypoint_confidence,
+            keypoint_covariance=keypoint_covariance,
+            head_bounding_box_2d=head_bounding_box_2d,
+            head_bounding_box_3d=head_bounding_box_3d,
+            head_position=head_position,
+            local_position_per_joint=local_position_per_joint,
+            local_orientation_per_joint=local_orientation_per_joint,
+            global_root_orientation=global_root_orientation,
+            keypoint_count=keypoint_count,
+            flags=body_flags,
+        )
+
+
+@dataclass
+class BodyFrame:
+    header: BodyTrackingMessageHeader
+    bodies: list[BodyTrack]
+
+    @property
+    def frame_count(self) -> int:
+        return self.header.frame_count
+
+    @property
+    def timestamp_ns(self) -> int:
+        return self.header.timestamp_ns
+
+    @property
+    def sdk_timestamp_ns(self) -> int:
+        return self.header.sdk_timestamp_ns
+
+    @property
+    def body_count(self) -> int:
+        return self.header.body_count
+
+    @property
+    def body_format(self) -> int:
+        return self.header.body_format
+
+    @property
+    def body_selection(self) -> int:
+        return self.header.body_selection
+
+    @property
+    def detection_model(self) -> int:
+        return self.header.detection_model
+
+    @property
+    def inference_precision(self) -> int:
+        return self.header.inference_precision
+
+    @property
+    def flags(self) -> int:
+        return self.header.flags
+
+    @property
+    def label(self) -> str:
+        return self.header.label
+
+
+def unmarshal_body_tracking_message(data: bytes) -> BodyFrame:
+    header = BodyTrackingMessageHeader.unmarshal(data)
+    header_size = BodyTrackingMessageHeader.size()
+    total_size = header_size + header.payload_size_bytes
+    if len(data) < total_size:
+        raise ValueError(f"Body tracking message truncated: {len(data)} < {total_size}")
+
+    bodies: list[BodyTrack] = []
+    offset = header_size
+
+    for _ in range(header.body_count):
+        bodies.append(
+            BodyTrack.unmarshal(
+                memoryview(data)[offset : offset + BODY_TRACKING_BODY_RECORD_SIZE]
+            )
+        )
+        offset += BODY_TRACKING_BODY_RECORD_SIZE
+
+    return BodyFrame(header=header, bodies=bodies)
 
 
 @dataclass

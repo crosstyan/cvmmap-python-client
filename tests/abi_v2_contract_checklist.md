@@ -1,6 +1,6 @@
 # ABI v2 Contract Checklist
 
-**Source of Truth:** `cv-mmap/docs/cvmmap.ksy`  
+**Source of Truth:** `cv-mmap/docs/cvmmap_shm_metadata_v1_v2.ksy`  
 **Contract Version:** v2 (major=2)  
 **Generated:** 2026-03-04
 
@@ -258,7 +258,7 @@ This document maps ALL v2 header/descriptor invariants to exact target code loca
 Run this grep to verify all normative fields are present in upstream ksy:
 
 ```bash
-cd /workspaces/zed-playground/cv-mmap && grep -n "plane_descriptor_size\|plane_descriptor_capacity\|plane_presence_mask" docs/cvmmap.ksy
+cd /workspaces/zed-playground/cv-mmap && grep -n "plane_descriptor_size\|plane_descriptor_capacity\|plane_presence_mask" docs/cvmmap_shm_metadata_v1_v2.ksy
 ```
 
 Expected output should include:

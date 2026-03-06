@@ -18,6 +18,9 @@ Socket = _zmq_asyncio.Socket
 
 from .msg import (
     SyncMessage,
+    BodyFrame,
+    BodyTrack,
+    BodyTrackingMessageHeader,
     FrameMetadata,
     FrameMetadataV2,
     FrameMetadataV2Header,
@@ -28,6 +31,7 @@ from .msg import (
     ControlMessageResponse,
     FRAME_TOPIC_MAGIC,
     MODULE_STATUS_MAGIC,
+    BODY_TRACKING_MAGIC,
     CV_MMAP_MAGIC,
     CV_MMAP_MAGIC_LEN,
     CONTROL_MSG_CMD_GENERIC,
@@ -36,6 +40,7 @@ from .msg import (
     MODULE_STATUS_OFFLINE,
     MODULE_STATUS_STREAM_RESET,
     unmarshal_frame_metadata,
+    unmarshal_body_tracking_message,
     FRAME_METADATA_REGION_SIZE,
 )
 from .shm import SharedMemory
@@ -140,9 +145,13 @@ def _resolve_target(name_or_uri: str) -> _ResolvedTarget:
 # Re-export message types for convenience
 __all__ = [
     "CvMmapClient",
+    "CvMmapBodyStream",
     "CvMmapRequestClient",
     "CvMmapConfig",
     "SyncMessage",
+    "BodyFrame",
+    "BodyTrack",
+    "BodyTrackingMessageHeader",
     "FrameMetadata",
     "FrameMetadataV2",
     "FrameMetadataV2Header",
@@ -180,6 +189,11 @@ class CvMmapClient:
     def zmq_addr(self) -> str:
         """Get the ZMQ address used by this client."""
         return f"ipc://{self._prefix}/{self.shm_name}"
+
+    @property
+    def zmq_body_addr(self) -> str:
+        """Get the ZMQ body address used by this client."""
+        return f"ipc://{self._prefix}/{self.shm_name}_body"
 
     def _subscribe(self):
         """
@@ -245,6 +259,9 @@ class CvMmapClient:
 
         self._image_buffer = None
         self._shm = None
+
+    def body_stream(self) -> "CvMmapBodyStream":
+        return CvMmapBodyStream(self._name, self.zmq_body_addr)
 
     _SHM_PAYLOAD_OFFSET: int = 256
 
@@ -387,6 +404,49 @@ class CvMmapClient:
                         yield self.left_plane(metadata), metadata
                     else:
                         raise RuntimeError(f"Unknown message magic: {magic:#x}")
+
+
+class CvMmapBodyStream:
+    """Async iterator over the optional body tracking PUB substream."""
+
+    def __init__(self, instance_name: str, zmq_body_addr: str):
+        self._name = instance_name
+        self._zmq_body_addr = zmq_body_addr
+        self._ctx = Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.connect(self._zmq_body_addr)
+        self._sock.subscribe(b"")
+        self._poller = Poller()
+        self._poller.register(self._sock, zmq.POLLIN)
+
+    async def __aiter__(self) -> AsyncGenerator[BodyFrame, None]:
+        while True:
+            events = await self._poller.poll()
+            for socket, event in events:
+                if not (event & zmq.POLLIN):
+                    continue
+                message = cast(bytes, await socket.recv())
+                if len(message) < 1:
+                    raise RuntimeError("Received empty body message")
+                if message[0] != BODY_TRACKING_MAGIC:
+                    raise RuntimeError(
+                        f"Unknown body stream message magic: {message[0]:#x}"
+                    )
+                body_frame = unmarshal_body_tracking_message(message)
+                if body_frame.label and body_frame.label != self._name:
+                    raise RuntimeError(
+                        f"Body label mismatch: expected '{self._name}', got '{body_frame.label}'"
+                    )
+                yield body_frame
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class CvMmapConfig(TypedDict):
