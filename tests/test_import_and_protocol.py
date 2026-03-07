@@ -273,12 +273,51 @@ def test_body_tracking_message_parse_pass() -> None:
     frame = cvmmap_msg.unmarshal_body_tracking_message(header + payload)
     assert frame.frame_count == 42
     assert frame.header.body_count == 1
+    assert frame.coordinate_system == 0
+    assert frame.reference_frame == 0
+    assert frame.floor_as_origin is False
     assert frame.label == "example"
     assert len(frame.bodies) == 1
     assert frame.bodies[0].id == 7
     assert np.allclose(frame.bodies[0].position, np.array([1.0, 2.0, 3.0]))
     assert frame.bodies[0].keypoint_count == 1
     assert frame.bodies[0].flags == 2
+
+
+def test_body_tracking_message_parses_extended_frame_metadata() -> None:
+    header_fmt = cvmmap.BodyTrackingMessageHeader.PACK_FMT
+    payload = b"\0" * cvmmap_msg.BODY_TRACKING_BODY_RECORD_SIZE
+
+    header = struct.pack(
+        header_fmt,
+        cvmmap_msg.BODY_TRACKING_MAGIC,
+        7,
+        cvmmap_msg.VERSION_MAJOR,
+        cvmmap_msg.VERSION_MINOR,
+        9,
+        111,
+        222,
+        1,
+        cvmmap_msg.BODY_TRACKING_BODY_RECORD_SIZE,
+        cvmmap_msg.BODY_FORMAT_BODY_38,
+        cvmmap_msg.BODY_KEYPOINT_SELECTION_UPPER_BODY,
+        cvmmap_msg.BODY_TRACKING_MODEL_HUMAN_BODY_MEDIUM,
+        cvmmap_msg.INFERENCE_PRECISION_FP16,
+        cvmmap_msg.BODY_TRACKING_FLAG_FLOOR_AS_ORIGIN,
+        11,
+        len(payload),
+        b"meta".ljust(24, b"\0"),
+    )
+
+    frame = cvmmap_msg.unmarshal_body_tracking_message(header + payload)
+
+    assert frame.coordinate_system == 7
+    assert frame.reference_frame == 11
+    assert frame.floor_as_origin is True
+    assert frame.header.coordinate_system == 7
+    assert frame.header.reference_frame == 11
+    assert frame.header.floor_as_origin is True
+    assert frame.flags & cvmmap_msg.BODY_TRACKING_FLAG_FLOOR_AS_ORIGIN
 
 
 def test_body_tracking_message_invalid_record_size_rejected() -> None:

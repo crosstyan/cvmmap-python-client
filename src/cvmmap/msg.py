@@ -94,6 +94,7 @@ BODY_TRACKING_FLAG_IS_NEW = 0x0001
 BODY_TRACKING_FLAG_IS_TRACKED = 0x0002
 BODY_TRACKING_FLAG_BODY_FITTING_ENABLED = 0x0004
 BODY_TRACKING_FLAG_REDUCED_PRECISION_REQUESTED = 0x0008
+BODY_TRACKING_FLAG_FLOOR_AS_ORIGIN = 0x0010
 
 BODY_TRACKING_BODY_FLAG_HAS_LOCAL_JOINTS = 0x0001
 BODY_TRACKING_BODY_FLAG_HAS_ROOT_ORIENTATION = 0x0002
@@ -211,6 +212,9 @@ class BodyTrackingMessageHeader:
     detection_model: int
     inference_precision: int
     flags: int
+    coordinate_system: int
+    reference_frame: int
+    floor_as_origin: bool
     payload_size_bytes: int
     label: str
 
@@ -230,7 +234,7 @@ class BodyTrackingMessageHeader:
 
         (
             magic,
-            _reserved_0,
+            coordinate_system_code,
             versions_major,
             versions_minor,
             frame_count,
@@ -243,7 +247,7 @@ class BodyTrackingMessageHeader:
             detection_model,
             inference_precision,
             flags,
-            _reserved_1,
+            reference_frame_code,
             payload_size_bytes,
             label_bytes,
         ) = struct.unpack(
@@ -295,6 +299,9 @@ class BodyTrackingMessageHeader:
             detection_model=detection_model,
             inference_precision=inference_precision,
             flags=flags,
+            coordinate_system=coordinate_system_code,
+            reference_frame=reference_frame_code,
+            floor_as_origin=(flags & BODY_TRACKING_FLAG_FLOOR_AS_ORIGIN) != 0,
             payload_size_bytes=payload_size_bytes,
             label=label_bytes.split(b"\0", 1)[0].decode("utf-8"),
         )
@@ -439,6 +446,18 @@ class BodyFrame:
     @property
     def flags(self) -> int:
         return self.header.flags
+
+    @property
+    def coordinate_system(self) -> int:
+        return self.header.coordinate_system
+
+    @property
+    def reference_frame(self) -> int:
+        return self.header.reference_frame
+
+    @property
+    def floor_as_origin(self) -> bool:
+        return self.header.floor_as_origin
 
     @property
     def label(self) -> str:
