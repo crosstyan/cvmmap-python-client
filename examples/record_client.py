@@ -1,5 +1,8 @@
 import asyncio
+import anyio
 import click
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
@@ -13,12 +16,179 @@ from cvmmap.msg import (
     PIXEL_FORMAT_BGRA,
     PIXEL_FORMAT_RGBA,
 )
-
-
 from typing import Optional, Literal, TypeAlias
 
 ViewMode: TypeAlias = Literal["left", "depth", "both"]
 LeftOrder: TypeAlias = Literal["auto", "bgr", "rgb", "bgra", "rgba"]
+RecordingState: TypeAlias = Literal["idle", "recording", "saving"]
+
+
+@dataclass
+class PendingDepthSave:
+    task: asyncio.Task[Optional[Path]]
+    target_path: Path
+
+
+class DepthNpzRecorder:
+    def __init__(self, output_path: Path):
+        self.output_path = output_path
+        self._records: list[
+            tuple[int, int, Optional[np.ndarray], Optional[np.ndarray]]
+        ] = []
+
+    def append(
+        self,
+        frame_count: int,
+        timestamp_ns: int,
+        depth: Optional[np.ndarray],
+        confidence: Optional[np.ndarray],
+    ) -> None:
+        depth_copy = (
+            None if depth is None else np.asarray(depth, dtype=np.float32).copy()
+        )
+        confidence_copy = None if confidence is None else np.asarray(confidence).copy()
+        self._records.append(
+            (int(frame_count), int(timestamp_ns), depth_copy, confidence_copy)
+        )
+
+    def write(self, fps: Optional[float] = None) -> Optional[Path]:
+        if not self._records:
+            return None
+
+        first_depth = next(
+            (depth for _, _, depth, _ in self._records if depth is not None),
+            None,
+        )
+        if first_depth is None:
+            return None
+
+        depth_shape = first_depth.shape
+        first_confidence = next(
+            (
+                confidence
+                for _, _, _, confidence in self._records
+                if confidence is not None
+            ),
+            None,
+        )
+
+        depth_frames: list[np.ndarray] = []
+        depth_present_mask: list[bool] = []
+        confidence_frames: list[np.ndarray] = []
+        confidence_present_mask: list[bool] = []
+        frame_counts: list[int] = []
+        timestamp_ns_values: list[int] = []
+
+        for frame_count, timestamp_ns, depth, confidence in self._records:
+            frame_counts.append(frame_count)
+            timestamp_ns_values.append(timestamp_ns)
+
+            if depth is None:
+                depth_frames.append(np.full(depth_shape, np.nan, dtype=np.float32))
+                depth_present_mask.append(False)
+            else:
+                if depth.shape != depth_shape:
+                    raise ValueError(
+                        "Depth frame shape changed during recording: "
+                        f"expected {depth_shape}, got {depth.shape}"
+                    )
+                depth_frames.append(depth)
+                depth_present_mask.append(True)
+
+            if first_confidence is None:
+                continue
+
+            if confidence is None:
+                confidence_frames.append(
+                    np.zeros(first_confidence.shape, dtype=first_confidence.dtype)
+                )
+                confidence_present_mask.append(False)
+                continue
+
+            if confidence.shape != first_confidence.shape:
+                raise ValueError(
+                    "Confidence frame shape changed during recording: "
+                    f"expected {first_confidence.shape}, got {confidence.shape}"
+                )
+            confidence_frames.append(confidence)
+            confidence_present_mask.append(True)
+
+        payload: dict[str, np.ndarray] = {
+            "depth_mm": np.stack(depth_frames, axis=0),
+            "timestamp_ns": np.asarray(timestamp_ns_values, dtype=np.uint64),
+            "frame_count": np.asarray(frame_counts, dtype=np.uint64),
+            "depth_present_mask": np.asarray(depth_present_mask, dtype=bool),
+            "frame_total": np.asarray(len(self._records), dtype=np.uint64),
+            "depth_units": np.asarray("millimeters"),
+            "source_depth_dtype": np.asarray(str(first_depth.dtype)),
+        }
+        if fps is not None:
+            payload["fps"] = np.asarray(float(fps), dtype=np.float32)
+        if first_confidence is not None:
+            payload["confidence"] = np.stack(confidence_frames, axis=0)
+            payload["confidence_present_mask"] = np.asarray(
+                confidence_present_mask,
+                dtype=bool,
+            )
+            payload["source_confidence_dtype"] = np.asarray(
+                str(first_confidence.dtype)
+            )
+
+        np.savez_compressed(self.output_path, **payload)
+        return self.output_path
+
+
+async def write_depth_npz(
+    depth_recorder: DepthNpzRecorder,
+    fps: Optional[float],
+) -> Optional[Path]:
+    return await anyio.to_thread.run_sync(depth_recorder.write, fps)
+
+
+def stop_recording(
+    writer: Optional[cv2.VideoWriter],
+    depth_recorder: Optional[DepthNpzRecorder],
+    frame_count: int,
+    fps: Optional[float],
+) -> tuple[None, None, Optional[PendingDepthSave]]:
+    if writer is not None:
+        writer.release()
+
+    logger.info(f"Stopped recording. Saved {frame_count} frames.")
+    if depth_recorder is None:
+        return None, None, None
+
+    logger.info(
+        f"Saving depth NPZ in background to {depth_recorder.output_path}. "
+        "Preview stays live while the file is finalized."
+    )
+    pending_save = PendingDepthSave(
+        task=asyncio.create_task(write_depth_npz(depth_recorder, fps)),
+        target_path=depth_recorder.output_path,
+    )
+    return None, None, pending_save
+
+
+async def finish_depth_save(pending_save: PendingDepthSave) -> None:
+    try:
+        depth_output_path = await pending_save.task
+    except Exception:
+        logger.exception(f"Failed to save depth NPZ to {pending_save.target_path}")
+        return
+
+    if depth_output_path is None:
+        logger.info(
+            "No depth planes were recorded during this session; "
+            "skipped depth NPZ export."
+        )
+        return
+
+    logger.success(f"Saved depth NPZ to {depth_output_path}")
+
+
+def safe_stream_name(stream_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", stream_name).strip("._-")
+    return slug or "stream"
 
 
 def to_bgr(frame: np.ndarray, pixel_format: int, left_order: LeftOrder) -> np.ndarray:
@@ -62,7 +232,10 @@ def depth_to_colormap(depth: np.ndarray) -> np.ndarray:
         high = low + 1.0
 
     clipped = np.clip(d, low, high)
-    scaled = ((clipped - low) * (255.0 / (high - low))).astype(np.uint8)
+    scaled = np.zeros(d.shape, dtype=np.uint8)
+    scaled[valid] = (
+        (clipped[valid] - low) * (255.0 / (high - low))
+    ).astype(np.uint8)
     return cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO)
 
 
@@ -125,8 +298,11 @@ async def record_client(
         ) from exc
 
     # State variables for recording
-    recording = False
-    writer = None
+    recording_state: RecordingState = "idle"
+    writer: Optional[cv2.VideoWriter] = None
+    depth_recorder: Optional[DepthNpzRecorder] = None
+    recording_fps: Optional[float] = None
+    pending_depth_save: Optional[PendingDepthSave] = None
     frame_count = 0
 
     # FPS estimation using timestamps from metadata
@@ -136,6 +312,11 @@ async def record_client(
         current_frame = first_frame
         current_meta = first_meta
         while True:
+            if pending_depth_save is not None and pending_depth_save.task.done():
+                await finish_depth_save(pending_depth_save)
+                pending_depth_save = None
+                recording_state = "idle"
+
             frame = current_frame
             meta = current_meta
             # Update FPS estimation queue using metadata timestamps (nanoseconds)
@@ -144,14 +325,14 @@ async def record_client(
                 last_timestamps.pop(0)
             left_bgr = to_bgr(frame, meta.info.pixel_format, left_order)
             depth = client.depth_plane(meta)
+            confidence = client.confidence_plane(meta)
             depth_bgr = None if depth is None else depth_to_colormap(depth)
             active_view_mode: ViewMode = view_cycle[view_idx]
             display_frame = compose_display(left_bgr, depth_bgr, active_view_mode)
-            if recording:
+            if recording_state != "idle":
                 display_frame = display_frame.copy()
 
-            # Add visual indicator if recording
-            if recording:
+            if recording_state == "recording":
                 _ = cv2.circle(display_frame, (30, 30), 10, (0, 0, 255), -1)
                 _ = cv2.putText(
                     display_frame,
@@ -162,15 +343,33 @@ async def record_client(
                     (0, 0, 255),
                     2,
                 )
+            elif recording_state == "saving":
+                _ = cv2.circle(display_frame, (30, 30), 10, (0, 215, 255), -1)
+                _ = cv2.putText(
+                    display_frame,
+                    "SAVING",
+                    (50, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 215, 255),
+                    2,
+                )
             cv2.namedWindow(f"Preview: {stream_name}", cv2.WINDOW_NORMAL)
             cv2.imshow(f"Preview: {stream_name}", display_frame)
 
             # --- RECORDING ---
-            if recording and writer is not None:
+            if recording_state == "recording" and writer is not None:
                 # writer.write blocks slightly, but NVENC/hardware encoders are fast.
                 # If disk I/O blocks too much, this could cause ZeroMQ conflate to
                 # drop frames (which is intended behavior for real-time systems to avoid memory explosion).
                 writer.write(display_frame)
+                if depth_recorder is not None:
+                    depth_recorder.append(
+                        frame_count=meta.frame_count,
+                        timestamp_ns=meta.timestamp_ns,
+                        depth=depth,
+                        confidence=confidence,
+                    )
                 frame_count += 1
 
             # --- INPUT HANDLING ---
@@ -181,12 +380,11 @@ async def record_client(
                 break
 
             elif key == ord(" "):  # Spacebar toggles recording
-                recording = not recording
-
-                if recording:
+                if recording_state == "idle":
                     # START RECORDING
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = out_path / f"record_{stream_name}_{timestamp}.mp4"
+                    stream_slug = safe_stream_name(stream_name)
+                    filename = out_path / f"record_{stream_slug}_{timestamp}.mp4"
 
                     height: int = int(display_frame.shape[0])
                     width: int = int(display_frame.shape[1])
@@ -235,19 +433,42 @@ async def record_client(
 
                     if not writer.isOpened():
                         logger.error(f"Failed to open video writer for {filename}!")
-                        recording = False
+                        recording_state = "idle"
+                        writer = None
+                        depth_recorder = None
+                        recording_fps = None
                     else:
+                        depth_recorder = DepthNpzRecorder(
+                            filename.with_name(f"{filename.stem}_depth.npz")
+                        )
+                        recording_fps = fps
                         frame_count = 0
+                        recording_state = "recording"
                         logger.success(
                             f"Started recording to {filename} ({width}x{height})"
                         )
+                        logger.info(
+                            "Depth NPZ sidecar will be saved automatically "
+                            "if depth frames are available."
+                        )
 
-                else:
+                elif recording_state == "recording":
                     # STOP RECORDING
-                    if writer:
-                        writer.release()
-                        writer = None
-                    logger.info(f"Stopped recording. Saved {frame_count} frames.")
+                    writer, depth_recorder, pending_depth_save = stop_recording(
+                        writer=writer,
+                        depth_recorder=depth_recorder,
+                        frame_count=frame_count,
+                        fps=recording_fps,
+                    )
+                    recording_fps = None
+                    recording_state = (
+                        "saving" if pending_depth_save is not None else "idle"
+                    )
+                else:
+                    logger.info(
+                        "Depth NPZ is still saving in the background. "
+                        "Wait for the save to finish before starting a new recording."
+                    )
             elif key == ord("m"):
                 view_idx = (view_idx + 1) % len(view_cycle)
                 logger.info(f"Switched view mode to: {view_cycle[view_idx]}")
@@ -261,8 +482,18 @@ async def record_client(
         logger.info("Client task cancelled.")
     finally:
         # Cleanup
-        if writer:
-            writer.release()
+        if recording_state == "recording":
+            writer, depth_recorder, pending_depth_save = stop_recording(
+                writer=writer,
+                depth_recorder=depth_recorder,
+                frame_count=frame_count,
+                fps=recording_fps,
+            )
+            recording_fps = None
+            recording_state = "saving" if pending_depth_save is not None else "idle"
+        if pending_depth_save is not None:
+            logger.info("Waiting for background depth save to finish...")
+            await finish_depth_save(pending_depth_save)
         cv2.destroyAllWindows()
         logger.info("Exiting.")
 
