@@ -222,3 +222,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+## Project
+recordings/
+
