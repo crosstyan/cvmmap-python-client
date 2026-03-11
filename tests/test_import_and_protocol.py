@@ -29,6 +29,12 @@ def _load_fixture_bytes(filename: str) -> bytes:
     return bytes.fromhex((FIXTURE_DIR / filename).read_text(encoding="utf-8"))
 
 
+def _patch_v2_depth_unit(metadata_region: bytes, depth_unit: int) -> bytes:
+    patched = bytearray(metadata_region)
+    patched[0x2C] = depth_unit
+    return bytes(patched)
+
+
 def _load_core_uri_fixture() -> dict:
     return json.loads(CORE_FIXTURE_PATH.read_text(encoding="utf-8"))
 
@@ -105,6 +111,7 @@ def test_v2_left_only_parse_pass() -> None:
     assert left.strides == (6, 3, 1)
     assert left[0, 0].tolist() == [1, 2, 3]
     assert left[1, 1].tolist() == [10, 11, 12]
+    assert metadata.depth_unit == cvmmap.DEPTH_UNIT_UNKNOWN
     assert metadata.depth_plane(left_payload) is None
     assert metadata.confidence_plane(left_payload) is None
 
@@ -125,6 +132,7 @@ def test_v2_left_depth_parse_pass() -> None:
 
     depth = metadata.depth_plane(payload)
     assert depth is not None
+    assert metadata.depth_unit == cvmmap.DEPTH_UNIT_UNKNOWN
     assert depth.shape == (2, 2)
     assert depth.dtype == np.float32
     assert depth.strides == (12, 4)
@@ -143,6 +151,7 @@ def test_v2_left_depth_confidence_parse_pass() -> None:
 
     assert isinstance(metadata, cvmmap.FrameMetadataV2)
     assert metadata.confidence_descriptor is not None
+    assert metadata.depth_unit == cvmmap.DEPTH_UNIT_UNKNOWN
 
     confidence = metadata.confidence_plane(payload)
     assert confidence is not None
@@ -150,6 +159,22 @@ def test_v2_left_depth_confidence_parse_pass() -> None:
     assert confidence.dtype == np.uint8
     assert confidence.strides == (2, 1)
     assert confidence.tolist() == [[10, 20], [30, 40]]
+
+
+def test_v2_explicit_depth_unit_parse_pass() -> None:
+    payload = _load_fixture_bytes("v2_left_depth_valid_payload.hex")
+    metadata_region = _patch_v2_depth_unit(
+        _load_fixture_bytes("v2_left_depth_valid_metadata.hex"),
+        cvmmap.DEPTH_UNIT_METER,
+    )
+    metadata = cvmmap_msg.unmarshal_frame_metadata(metadata_region)
+
+    assert isinstance(metadata, cvmmap.FrameMetadataV2)
+    assert metadata.header.depth_unit == cvmmap.DEPTH_UNIT_METER
+    assert metadata.depth_unit == cvmmap.DEPTH_UNIT_METER
+    depth = metadata.depth_plane(payload)
+    assert depth is not None
+    assert np.isclose(depth[0, 0], 1.5)
 
 
 def test_client_confidence_plane_helper() -> None:
@@ -174,6 +199,37 @@ def test_client_confidence_plane_helper() -> None:
         assert confidence.tolist() == [[10, 20], [30, 40]]
     finally:
         client._sock.close()
+
+
+def test_client_depth_unit_helper() -> None:
+    client = cvmmap.CvMmapClient("example")
+
+    try:
+        metadata_region = _patch_v2_depth_unit(
+            _load_fixture_bytes("v2_left_depth_valid_metadata.hex"),
+            cvmmap.DEPTH_UNIT_MILLIMETER,
+        )
+        payload = _load_fixture_bytes("v2_left_depth_valid_payload.hex")
+        client._shm = _FakeSharedMemory(metadata_region + payload)
+        metadata = client._read_metadata()
+
+        assert client.depth_unit(metadata) == cvmmap.DEPTH_UNIT_MILLIMETER
+    finally:
+        client._sock.close()
+
+
+def test_invalid_v2_depth_unit_rejected() -> None:
+    metadata_region = _patch_v2_depth_unit(
+        _load_fixture_bytes("v2_left_depth_valid_metadata.hex"),
+        3,
+    )
+
+    try:
+        cvmmap_msg.unmarshal_frame_metadata(metadata_region)
+    except ValueError as exc:
+        assert "depth_unit" in str(exc)
+    else:
+        raise AssertionError("Expected invalid v2 depth_unit to be rejected")
 
 
 def test_v2_malformed_descriptor_rejected() -> None:

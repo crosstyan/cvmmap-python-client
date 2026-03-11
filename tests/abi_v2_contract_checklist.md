@@ -38,7 +38,8 @@ This document maps ALL v2 header/descriptor invariants to exact target code loca
 | 0x24 | `plane_descriptor_size` | u2 | 358-360 | Must equal `24` |
 | 0x26 | `plane_descriptor_capacity` | u2 | 361-363 | Must equal `4` |
 | 0x28 | `payload_size_bytes` | u4 | 364-366 | Must be greater than `0` |
-| 0x2C | `reserved_0[20]` | bytes | 367-368 | 20 reserved bytes |
+| 0x2C | `depth_unit` | u1 | 367-368 | Enum: `unknown=0`, `millimeter=1`, `meter=2` |
+| 0x2D | `reserved_0[19]` | bytes | 367-368 | 19 reserved bytes |
 
 ### KSY Instance Constraints
 
@@ -129,8 +130,9 @@ This document maps ALL v2 header/descriptor invariants to exact target code loca
 | `plane_descriptors_offset` | - | **TODO** | Validate u16 descriptor offset == 64 |
 | `plane_descriptor_size` | - | **TODO** | Validate u16 descriptor size == 24 |
 | `plane_descriptor_capacity` | - | **TODO** | Validate u16 descriptor capacity == 4 |
-| `payload_size_bytes` | - | **TODO** | Add u32 payload size parsing |
-| `reserved_0[20]` | - | **TODO** | Skip 20 reserved bytes |
+| `payload_size_bytes` | `src/cvmmap/msg.py` | IMPLEMENTED | Parsed on `FrameMetadataV2Header` |
+| `depth_unit` | `src/cvmmap/msg.py` | IMPLEMENTED | Parsed and validated on `FrameMetadataV2Header` |
+| `reserved_0[19]` | `src/cvmmap/msg.py` | IMPLEMENTED | Skipped after `depth_unit` |
 
 ### Current v1 `FrameInfo` (12 bytes) - `src/cvmmap/msg.py:169-232`
 
@@ -260,10 +262,11 @@ This document maps ALL v2 header/descriptor invariants to exact target code loca
 Run this grep to verify all normative fields are present in upstream ksy:
 
 ```bash
-cd /workspaces/zed-playground/cv-mmap && grep -n "plane_descriptor_size\|plane_descriptor_capacity\|plane_presence_mask" docs/cvmmap_shm_metadata_v1_v2.ksy
+cd /workspaces/zed-playground/cv-mmap && grep -n "depth_unit\|plane_descriptor_size\|plane_descriptor_capacity\|plane_presence_mask" docs/cvmmap_shm_metadata_v1_v2.ksy
 ```
 
 Expected output should include:
-- Line 352: `plane_presence_mask`
-- Line 358-360: `plane_descriptor_size`
-- Line 361-363: `plane_descriptor_capacity`
+- `depth_unit`
+- `plane_presence_mask`
+- `plane_descriptor_size`
+- `plane_descriptor_capacity`

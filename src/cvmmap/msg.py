@@ -56,6 +56,10 @@ DEPTH_F32 = 5
 DEPTH_F64 = 6
 DEPTH_F16 = 7
 
+DEPTH_UNIT_UNKNOWN = 0
+DEPTH_UNIT_MILLIMETER = 1
+DEPTH_UNIT_METER = 2
+
 # "CV-MMAP\0" exactly 8 bytes – see `frame_metadata_t::CV_MMAP_MAGIC` in C++
 CV_MMAP_MAGIC: bytes = b"CV-MMAP\0"
 CV_MMAP_MAGIC_LEN: int = len(CV_MMAP_MAGIC)
@@ -816,8 +820,9 @@ class FrameMetadataV2Header:
     plane_descriptor_size: int
     plane_descriptor_capacity: int
     payload_size_bytes: int
+    depth_unit: int
 
-    PACK_FMT = "=8sBBHIQQBBHHHI20s"
+    PACK_FMT = "=8sBBHIQQBBHHHIB19s"
 
     @staticmethod
     def size() -> int:
@@ -844,6 +849,7 @@ class FrameMetadataV2Header:
             plane_descriptor_size,
             plane_descriptor_capacity,
             payload_size_bytes,
+            depth_unit,
             _reserved_0,
         ) = struct.unpack(
             FrameMetadataV2Header.PACK_FMT, data[: FrameMetadataV2Header.size()]
@@ -886,6 +892,14 @@ class FrameMetadataV2Header:
             raise ValueError(
                 f"Invalid v2 payload_size_bytes: expected >0, got {payload_size_bytes}"
             )
+        if depth_unit not in (
+            DEPTH_UNIT_UNKNOWN,
+            DEPTH_UNIT_MILLIMETER,
+            DEPTH_UNIT_METER,
+        ):
+            raise ValueError(
+                f"Invalid v2 depth_unit: expected 0, 1, or 2, got {depth_unit}"
+            )
 
         return FrameMetadataV2Header(
             versions_minor=versions_minor,
@@ -899,6 +913,7 @@ class FrameMetadataV2Header:
             plane_descriptor_size=plane_descriptor_size,
             plane_descriptor_capacity=plane_descriptor_capacity,
             payload_size_bytes=payload_size_bytes,
+            depth_unit=depth_unit,
         )
 
 
@@ -943,6 +958,10 @@ class FrameMetadataV2:
             pixel_format=left.pixel_format,
             buffer_size=self.header.payload_size_bytes,
         )
+
+    @property
+    def depth_unit(self) -> int:
+        return self.header.depth_unit
 
     @property
     def left_descriptor(self) -> FramePlaneDescriptorV2:

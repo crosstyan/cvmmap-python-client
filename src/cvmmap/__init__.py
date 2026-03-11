@@ -29,6 +29,9 @@ from .msg import (
     ModuleStatusMessage,
     ControlMessageRequest,
     ControlMessageResponse,
+    DEPTH_UNIT_UNKNOWN,
+    DEPTH_UNIT_MILLIMETER,
+    DEPTH_UNIT_METER,
     FRAME_TOPIC_MAGIC,
     MODULE_STATUS_MAGIC,
     BODY_TRACKING_MAGIC,
@@ -157,6 +160,9 @@ __all__ = [
     "FrameMetadataV2Header",
     "FramePlaneDescriptorV2",
     "FrameInfo",
+    "DEPTH_UNIT_UNKNOWN",
+    "DEPTH_UNIT_MILLIMETER",
+    "DEPTH_UNIT_METER",
     "ModuleStatusMessage",
     "ControlMessageRequest",
     "ControlMessageResponse",
@@ -271,12 +277,12 @@ class CvMmapClient:
         The memory layout written by the C++ producer is:
 
         ```
-        0-7   : "CV-MMAP\0" magic bytes
-        8-…  : FrameMetadata packed struct (versions + frame_count + timestamp_ns + FrameInfo)
+        0-255 : SHM metadata region (v1 or v2, auto-detected)
+        256-… : payload region containing the packed active planes
         ```
 
-        This function validates the magic prefix and then uses the Python
-        struct definitions to unpack the metadata that follows.
+        This function validates the magic prefix and dispatches to the
+        matching Python struct definition for the metadata major version.
         """
         assert self._shm is not None, "Shared memory not attached"
         assert self._shm.buf is not None, "Shared memory buffer is None"
@@ -339,6 +345,11 @@ class CvMmapClient:
             return None
         payload = self._payload_view(metadata.header.payload_size_bytes)
         return metadata.confidence_plane(payload)
+
+    def depth_unit(self, metadata: FrameMetadataAny) -> int:
+        if not isinstance(metadata, FrameMetadataV2):
+            return DEPTH_UNIT_UNKNOWN
+        return metadata.depth_unit
 
     def _ensure_memory(self):
         """Attach to shared memory and initialize the numpy view if necessary."""

@@ -116,7 +116,9 @@ async for image, metadata in client:
     # access optional extra planes via client helpers when available
     depth = client.depth_plane(metadata)
     confidence = client.confidence_plane(metadata)
+    depth_unit = client.depth_unit(metadata)
     if depth is not None:
+        # depth_unit is one of DEPTH_UNIT_UNKNOWN / DEPTH_UNIT_MILLIMETER / DEPTH_UNIT_METER
         # process depth plane
         pass
     if confidence is not None:
@@ -125,6 +127,9 @@ async for image, metadata in client:
 ```
 
 See the producer's `docs/abi_v2_migration_guide.md` for full specifications.
+
+The v2 header byte at offset `0x2C` is parsed as `depth_unit`. Legacy v2
+packets with a zeroed byte remain valid and surface as `DEPTH_UNIT_UNKNOWN`.
 
 ### Body tracking substream
 
