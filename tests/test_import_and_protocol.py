@@ -1,3 +1,4 @@
+import asyncio
 from importlib import import_module
 import json
 import os
@@ -6,6 +7,7 @@ import struct
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -14,6 +16,16 @@ cvmmap_msg = import_module("cvmmap.msg")
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "protocol"
+CORE_PROTOCOL_FIXTURE_DIR = Path(
+    os.environ.get(
+        "CVMMAP_CORE_PROTOCOL_FIXTURE_DIR",
+        Path(__file__).resolve().parents[1].parent
+        / "cv-mmap"
+        / "core"
+        / "fixtures"
+        / "protocol",
+    )
+)
 CORE_FIXTURE_PATH = Path(
     os.environ.get(
         "CVMMAP_CORE_URI_FIXTURE",
@@ -37,6 +49,24 @@ def _patch_v2_depth_unit(metadata_region: bytes, depth_unit: int) -> bytes:
 
 def _load_core_uri_fixture() -> dict:
     return json.loads(CORE_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+
+def _require_core_protocol_fixture_dir() -> Path:
+    if CORE_PROTOCOL_FIXTURE_DIR.is_dir():
+        return CORE_PROTOCOL_FIXTURE_DIR
+    pytest.skip(
+        f"cv-mmap core protocol fixtures not available: {CORE_PROTOCOL_FIXTURE_DIR}"
+    )
+
+
+def _load_core_protocol_fixture_bytes(filename: str) -> bytes:
+    fixture_dir = _require_core_protocol_fixture_dir()
+    return (fixture_dir / filename).read_bytes()
+
+
+def _load_core_protocol_manifest() -> dict:
+    fixture_dir = _require_core_protocol_fixture_dir()
+    return json.loads((fixture_dir / "manifest.json").read_text(encoding="utf-8"))
 
 
 class _FakeSharedMemory:
@@ -74,14 +104,379 @@ def test_protocol_struct_sizes() -> None:
 
 
 def test_control_message_header_sizes() -> None:
-    """Assert control message headers match C++ struct sizes exactly.
+    """Assert control message headers match the actual wire layout.
 
-    C++ static_asserts:
-    - sizeof(control_message_request_t) == 36
-    - sizeof(control_message_response_t) == 40
+    The producer C++ structs are larger because of unsent tail padding after the
+    flexible-array length fields:
+
+    - request wire header: 34 bytes, C++ sizeof(...) == 36
+    - response wire header: 38 bytes, C++ sizeof(...) == 40
     """
-    assert cvmmap.ControlMessageRequest.header_size() == 36
-    assert cvmmap.ControlMessageResponse.header_size() == 40
+    assert cvmmap.ControlMessageRequest.header_size() == 34
+    assert cvmmap.ControlMessageResponse.header_size() == 38
+
+
+def test_control_request_and_response_payload_sizes() -> None:
+    assert cvmmap.SourceInfo.size() == 48
+    assert cvmmap.SeekTimestampRequest.size() == 12
+    assert cvmmap.SeekResult.size() == 28
+    assert cvmmap.RecordingStartRequest.size() == 8
+    assert cvmmap.RecordingStatus.size() == 20
+
+
+def test_source_info_roundtrip() -> None:
+    payload = struct.pack(
+        cvmmap.SourceInfo.PACK_FMT,
+        cvmmap.SourceInfo.size(),
+        cvmmap.SOURCE_KIND_FINITE,
+        cvmmap.TIMESTAMP_DOMAIN_UNIX_EPOCH_NS,
+        cvmmap.SOURCE_INFO_FLAG_CAN_SEEK
+        | cvmmap.SOURCE_INFO_FLAG_AUTO_LOOP
+        | cvmmap.SOURCE_INFO_FLAG_HAS_DEPTH
+        | cvmmap.SOURCE_INFO_FLAG_HAS_BODY
+        | cvmmap.SOURCE_INFO_FLAG_CAN_RECORD,
+        100,
+        250,
+        150,
+        175,
+        9,
+        0,
+    )
+
+    parsed = cvmmap.SourceInfo.unmarshal(payload)
+    assert parsed.source_kind == cvmmap.SOURCE_KIND_FINITE
+    assert parsed.timestamp_domain == cvmmap.TIMESTAMP_DOMAIN_UNIX_EPOCH_NS
+    assert parsed.timeline_start_ns == 100
+    assert parsed.timeline_end_ns == 250
+    assert parsed.duration_ns == 150
+    assert parsed.current_timestamp_ns == 175
+    assert parsed.current_frame_count == 9
+    assert parsed.can_seek is True
+    assert parsed.auto_loop is True
+    assert parsed.has_depth is True
+    assert parsed.has_body is True
+    assert parsed.can_record is True
+
+
+def test_seek_payload_roundtrip() -> None:
+    request = cvmmap.SeekTimestampRequest(target_timestamp_ns=123456789)
+    assert request.marshal() == struct.pack(
+        cvmmap.SeekTimestampRequest.PACK_FMT,
+        cvmmap.SeekTimestampRequest.size(),
+        0,
+        123456789,
+    )
+
+    payload = struct.pack(
+        cvmmap.SeekResult.PACK_FMT,
+        cvmmap.SeekResult.size(),
+        1,
+        0,
+        123456789,
+        123456999,
+        0,
+        0,
+    )
+    parsed = cvmmap.SeekResult.unmarshal(payload)
+    assert parsed.requested_timestamp_ns == 123456789
+    assert parsed.landed_timestamp_ns == 123456999
+    assert parsed.landed_frame_count == 0
+    assert parsed.exact_match is True
+
+
+def test_recording_payload_roundtrip() -> None:
+    request = cvmmap.RecordingStartRequest(output_path="/tmp/example.svo2")
+    assert request.marshal() == struct.pack(
+        cvmmap.RecordingStartRequest.PACK_FMT,
+        cvmmap.RecordingStartRequest.size(),
+        0,
+        len(b"/tmp/example.svo2"),
+        0,
+    ) + b"/tmp/example.svo2"
+
+    payload = struct.pack(
+        cvmmap.RecordingStatus.PACK_FMT,
+        cvmmap.RecordingStatus.size(),
+        cvmmap.RECORDING_FORMAT_SVO,
+        0,
+        cvmmap.RECORDING_STATUS_FLAG_CAN_RECORD
+        | cvmmap.RECORDING_STATUS_FLAG_IS_RECORDING
+        | cvmmap.RECORDING_STATUS_FLAG_LAST_FRAME_OK,
+        len(b"/tmp/example.svo2"),
+        42,
+        40,
+        0,
+    ) + b"/tmp/example.svo2"
+    parsed = cvmmap.RecordingStatus.unmarshal(payload)
+    assert parsed.recording_format == cvmmap.RECORDING_FORMAT_SVO
+    assert parsed.can_record is True
+    assert parsed.is_recording is True
+    assert parsed.is_paused is False
+    assert parsed.last_frame_ok is True
+    assert parsed.frames_ingested == 42
+    assert parsed.frames_encoded == 40
+    assert parsed.active_path == "/tmp/example.svo2"
+
+
+def test_recording_start_request_rejects_empty_path() -> None:
+    try:
+        cvmmap.RecordingStartRequest(output_path="").marshal()
+    except ValueError as exc:
+        assert "must not be empty" in str(exc)
+    else:
+        raise AssertionError("Expected empty recording output path to be rejected")
+
+
+def test_control_response_truncated_payload_rejected() -> None:
+    header = struct.pack(
+        cvmmap.ControlMessageResponse.marshal_format(),
+        cvmmap_msg.CONTROL_MESSAGE_RESPONSE_MAGIC,
+        cvmmap_msg.VERSION_MAJOR,
+        cvmmap_msg.VERSION_MINOR,
+        cvmmap_msg.CONTROL_MSG_CMD_GET_SOURCE_INFO,
+        cvmmap_msg.CONTROL_RESPONSE_OK,
+        b"example".ljust(cvmmap_msg.LABEL_LEN_MAX, b"\0"),
+        48,
+    )
+    try:
+        cvmmap.ControlMessageResponse.unmarshal(header + (b"\0" * 47))
+    except ValueError as exc:
+        assert "response payload" in str(exc)
+    else:
+        raise AssertionError("Expected truncated response payload to be rejected")
+
+
+def test_cpp_sync_fixture_roundtrip() -> None:
+    fixture = _load_core_protocol_manifest()["sync_valid"]
+    payload = _load_core_protocol_fixture_bytes(fixture["file"])
+
+    decoded = cvmmap.SyncMessage.unmarshal(payload)
+
+    assert len(payload) == fixture["size"]
+    assert decoded.frame_count == fixture["frame_count"]
+    assert decoded.timestamp_ns == fixture["timestamp_ns"]
+    assert decoded.label == fixture["label"]
+    assert (
+        payload
+        == cvmmap.SyncMessage(
+            frame_count=fixture["frame_count"],
+            timestamp_ns=fixture["timestamp_ns"],
+            label=fixture["label"],
+        ).marshal()
+    )
+
+
+def test_cpp_control_get_source_info_fixtures_parse() -> None:
+    manifest = _load_core_protocol_manifest()
+    request_fixture = manifest["control_request_get_source_info"]
+    response_fixture = manifest["control_response_get_source_info"]
+
+    request_payload = _load_core_protocol_fixture_bytes(request_fixture["file"])
+    response_payload = _load_core_protocol_fixture_bytes(response_fixture["file"])
+
+    assert len(request_payload) == request_fixture["size"]
+    assert request_payload == cvmmap.ControlMessageRequest(
+        label=request_fixture["label"],
+        command_id=request_fixture["command_id"],
+        request_message=b"",
+    ).marshal()
+
+    response = cvmmap.ControlMessageResponse.unmarshal(response_payload)
+    source_info = cvmmap.SourceInfo.unmarshal(response.response_message)
+    expected = response_fixture["source_info"]
+
+    assert len(response_payload) == response_fixture["size"]
+    assert response.command_id == response_fixture["command_id"]
+    assert response.response_code == response_fixture["response_code"]
+    assert response.label == response_fixture["label"]
+    assert source_info.source_kind == expected["source_kind"]
+    assert source_info.timestamp_domain == expected["timestamp_domain"]
+    assert source_info.flags == expected["flags"]
+    assert source_info.timeline_start_ns == expected["timeline_start_ns"]
+    assert source_info.timeline_end_ns == expected["timeline_end_ns"]
+    assert source_info.duration_ns == expected["duration_ns"]
+    assert source_info.current_timestamp_ns == expected["current_timestamp_ns"]
+    assert source_info.current_frame_count == expected["current_frame_count"]
+
+
+def test_cpp_control_seek_fixtures_parse() -> None:
+    manifest = _load_core_protocol_manifest()
+    request_fixture = manifest["control_request_seek_timestamp_ns"]
+    response_fixture = manifest["control_response_seek_timestamp_ns"]
+
+    request_payload = _load_core_protocol_fixture_bytes(request_fixture["file"])
+    response_payload = _load_core_protocol_fixture_bytes(response_fixture["file"])
+
+    expected_request = cvmmap.SeekTimestampRequest(
+        target_timestamp_ns=request_fixture["target_timestamp_ns"]
+    ).marshal()
+    assert len(request_payload) == request_fixture["size"]
+    assert request_payload == cvmmap.ControlMessageRequest(
+        label=request_fixture["label"],
+        command_id=request_fixture["command_id"],
+        request_message=expected_request,
+    ).marshal()
+
+    response = cvmmap.ControlMessageResponse.unmarshal(response_payload)
+    seek_result = cvmmap.SeekResult.unmarshal(response.response_message)
+    expected = response_fixture["seek_result"]
+
+    assert len(response_payload) == response_fixture["size"]
+    assert response.command_id == response_fixture["command_id"]
+    assert response.response_code == response_fixture["response_code"]
+    assert response.label == response_fixture["label"]
+    assert seek_result.requested_timestamp_ns == expected["requested_timestamp_ns"]
+    assert seek_result.landed_timestamp_ns == expected["landed_timestamp_ns"]
+    assert seek_result.landed_frame_count == expected["landed_frame_count"]
+    assert seek_result.exact_match is expected["exact_match"]
+
+
+def test_cpp_control_recording_fixtures_parse() -> None:
+    manifest = _load_core_protocol_manifest()
+    start_fixture = manifest["control_request_start_recording"]
+    stop_fixture = manifest["control_request_stop_recording"]
+    get_status_fixture = manifest["control_request_get_recording_status"]
+    status_fixture = manifest["control_response_recording_status"]
+
+    start_request_payload = _load_core_protocol_fixture_bytes(start_fixture["file"])
+    stop_request_payload = _load_core_protocol_fixture_bytes(stop_fixture["file"])
+    get_status_request_payload = _load_core_protocol_fixture_bytes(
+        get_status_fixture["file"]
+    )
+    response_payload = _load_core_protocol_fixture_bytes(status_fixture["file"])
+
+    expected_request = cvmmap.RecordingStartRequest(
+        output_path=start_fixture["output_path"]
+    ).marshal()
+    assert len(start_request_payload) == start_fixture["size"]
+    assert start_request_payload == cvmmap.ControlMessageRequest(
+        label=start_fixture["label"],
+        command_id=start_fixture["command_id"],
+        request_message=expected_request,
+    ).marshal()
+    assert len(stop_request_payload) == stop_fixture["size"]
+    assert stop_request_payload == cvmmap.ControlMessageRequest(
+        label=stop_fixture["label"],
+        command_id=stop_fixture["command_id"],
+        request_message=b"",
+    ).marshal()
+    assert len(get_status_request_payload) == get_status_fixture["size"]
+    assert get_status_request_payload == cvmmap.ControlMessageRequest(
+        label=get_status_fixture["label"],
+        command_id=get_status_fixture["command_id"],
+        request_message=b"",
+    ).marshal()
+
+    response = cvmmap.ControlMessageResponse.unmarshal(response_payload)
+    recording_status = cvmmap.RecordingStatus.unmarshal(response.response_message)
+    expected = status_fixture["recording_status"]
+
+    assert len(response_payload) == status_fixture["size"]
+    assert response.command_id == status_fixture["command_id"]
+    assert response.response_code == status_fixture["response_code"]
+    assert response.label == status_fixture["label"]
+    assert recording_status.recording_format == expected["recording_format"]
+    assert recording_status.flags == expected["flags"]
+    assert recording_status.active_path == expected["path"]
+    assert recording_status.frames_ingested == expected["frames_ingested"]
+    assert recording_status.frames_encoded == expected["frames_encoded"]
+
+
+def test_request_client_recording_methods() -> None:
+    payload = struct.pack(
+        cvmmap.RecordingStatus.PACK_FMT,
+        cvmmap.RecordingStatus.size(),
+        cvmmap.RECORDING_FORMAT_SVO,
+        0,
+        cvmmap.RECORDING_STATUS_FLAG_CAN_RECORD
+        | cvmmap.RECORDING_STATUS_FLAG_IS_RECORDING,
+        len(b"/tmp/test.svo2"),
+        10,
+        9,
+        0,
+    ) + b"/tmp/test.svo2"
+
+    async def _run() -> None:
+        client = object.__new__(cvmmap.CvMmapRequestClient)
+        client._sock = None  # type: ignore[attr-defined]
+
+        async def _ok_send_request(
+            command_id: int, request_message: bytes = b"", timeout_ms: int = 5000
+        ) -> cvmmap.ControlMessageResponse:
+            if command_id == cvmmap.CONTROL_MSG_CMD_START_RECORDING:
+                assert (
+                    request_message
+                    == cvmmap.RecordingStartRequest("/tmp/test.svo2").marshal()
+                )
+            return cvmmap.ControlMessageResponse(
+                command_id=command_id,
+                response_code=cvmmap.CONTROL_RESPONSE_OK,
+                label="example",
+                response_message=payload,
+            )
+
+        client.send_request = _ok_send_request  # type: ignore[method-assign]
+
+        started = await client.start_recording("/tmp/test.svo2")
+        assert started.is_recording is True
+        assert started.active_path == "/tmp/test.svo2"
+
+        stopped = await client.stop_recording()
+        assert stopped.frames_ingested == 10
+
+        status = await client.get_recording_status()
+        assert status.frames_encoded == 9
+
+        async def _error_send_request(
+            command_id: int, request_message: bytes = b"", timeout_ms: int = 5000
+        ) -> cvmmap.ControlMessageResponse:
+            return cvmmap.ControlMessageResponse(
+                command_id=command_id,
+                response_code=cvmmap.CONTROL_RESPONSE_UNSUPPORTED,
+                label="example",
+                response_message=b"",
+            )
+
+        client.send_request = _error_send_request  # type: ignore[method-assign]
+        try:
+            await client.get_recording_status()
+        except RuntimeError as exc:
+            assert "GET_RECORDING_STATUS failed with UNSUPPORTED (-7)" == str(exc)
+        else:
+            raise AssertionError("Expected get_recording_status() to raise")
+
+    asyncio.run(_run())
+
+
+def test_cpp_body_tracking_fixture_parse() -> None:
+    manifest = _load_core_protocol_manifest()["body_tracking_valid"]
+    payload = _load_core_protocol_fixture_bytes(manifest["file"])
+
+    frame = cvmmap_msg.unmarshal_body_tracking_message(payload)
+    expected_body = manifest["body"]
+
+    assert len(payload) == manifest["size"]
+    assert frame.frame_count == manifest["frame_count"]
+    assert frame.timestamp_ns == manifest["timestamp_ns"]
+    assert frame.sdk_timestamp_ns == manifest["sdk_timestamp_ns"]
+    assert frame.body_count == manifest["body_count"]
+    assert frame.body_format == manifest["body_format"]
+    assert frame.body_selection == manifest["body_selection"]
+    assert frame.detection_model == manifest["detection_model"]
+    assert frame.inference_precision == manifest["inference_precision"]
+    assert frame.flags == manifest["flags"]
+    assert frame.coordinate_system == manifest["coordinate_system"]
+    assert frame.reference_frame == manifest["reference_frame"]
+    assert frame.floor_as_origin is manifest["floor_as_origin"]
+    assert frame.label == manifest["label"]
+    assert len(frame.bodies) == 1
+    assert frame.bodies[0].id == expected_body["id"]
+    assert frame.bodies[0].tracking_state == expected_body["tracking_state"]
+    assert frame.bodies[0].action_state == expected_body["action_state"]
+    assert frame.bodies[0].confidence == expected_body["confidence"]
+    assert frame.bodies[0].keypoint_count == expected_body["keypoint_count"]
+    assert frame.bodies[0].flags == expected_body["flags"]
+    assert np.allclose(frame.bodies[0].position, np.array(expected_body["position"]))
 
 
 def test_v1_parse_pass() -> None:

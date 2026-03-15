@@ -90,12 +90,25 @@ This client stays aligned with producer-side IPC structures.
 | Component | Supported Versions | Notes |
 |-----------|-------------------|-------|
 | SHM Metadata | v1, v2 | Auto-detects from header magic and version fields |
-| Control Wire | v1 | Request/response structs match producer v1 |
+| Control Wire | v1 | Supports `RESET_FRAME_COUNT`, `GET_SOURCE_INFO`, `SEEK_TIMESTAMP_NS`, `START_RECORDING`, `STOP_RECORDING`, and `GET_RECORDING_STATUS` |
 | Sync Wire | v1 | ZMQ pub/sub framing unchanged |
 
 ### Migration window notes
 
 During the migration window, the producer may emit SHM v2 metadata while maintaining control/sync compatibility at v1. This is the intended mixed state.
+
+Control wire layout note:
+
+- request wire header: 34 bytes
+- response wire header: 38 bytes
+- producer C++ envelope structs are 36/40 bytes because of unsent tail padding after the flexible-array length field
+
+This client follows the actual on-wire layout and stays aligned with the upstream Kaitai schema in `cv-mmap/docs/cvmmap_control_v1.ksy`.
+
+Cross-repo compatibility tests can consume C++-generated fixtures directly from
+`cv-mmap/core/fixtures/protocol`. Override the location with
+`CVMMAP_CORE_PROTOCOL_FIXTURE_DIR=/path/to/cv-mmap/core/fixtures/protocol` when
+the sibling repo is not at the default local path.
 
 ### Rollout sequencing (for deployments)
 
@@ -143,4 +156,23 @@ client = CvMmapClient("default")
 async for body_frame in client.body_stream():
     for body in body_frame.bodies:
         print(body.id, body.position)
+```
+
+### Control requests
+
+```python
+from cvmmap import CvMmapRequestClient
+
+client = CvMmapRequestClient("default")
+info = await client.get_source_info()
+print(info.source_kind, info.can_seek, info.can_record)
+
+result = await client.seek_timestamp_ns(info.timeline_start_ns)
+print(result.landed_timestamp_ns, result.exact_match)
+
+status = await client.start_recording("/tmp/example.svo2")
+print(status.is_recording, status.active_path)
+
+status = await client.stop_recording()
+print(status.is_recording, status.frames_encoded)
 ```

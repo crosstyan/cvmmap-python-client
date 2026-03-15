@@ -29,6 +29,11 @@ from .msg import (
     ModuleStatusMessage,
     ControlMessageRequest,
     ControlMessageResponse,
+    SourceInfo,
+    SeekTimestampRequest,
+    SeekResult,
+    RecordingStartRequest,
+    RecordingStatus,
     DEPTH_UNIT_UNKNOWN,
     DEPTH_UNIT_MILLIMETER,
     DEPTH_UNIT_METER,
@@ -39,7 +44,38 @@ from .msg import (
     CV_MMAP_MAGIC_LEN,
     CONTROL_MSG_CMD_GENERIC,
     CONTROL_MSG_CMD_RESET_FRAME_COUNT,
+    CONTROL_MSG_CMD_GET_SOURCE_INFO,
+    CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS,
+    CONTROL_MSG_CMD_START_RECORDING,
+    CONTROL_MSG_CMD_STOP_RECORDING,
+    CONTROL_MSG_CMD_GET_RECORDING_STATUS,
     CONTROL_RESPONSE_OK,
+    CONTROL_RESPONSE_UNKNOWN_CMD,
+    CONTROL_RESPONSE_ERROR,
+    CONTROL_RESPONSE_INVALID_MAGIC,
+    CONTROL_RESPONSE_INVALID_LABEL,
+    CONTROL_RESPONSE_INVALID_VERSION,
+    CONTROL_RESPONSE_INVALID_MSG_SIZE,
+    CONTROL_RESPONSE_UNSUPPORTED,
+    CONTROL_RESPONSE_INVALID_PAYLOAD,
+    CONTROL_RESPONSE_OUT_OF_RANGE,
+    SOURCE_KIND_UNKNOWN,
+    SOURCE_KIND_LIVE,
+    SOURCE_KIND_FINITE,
+    TIMESTAMP_DOMAIN_UNKNOWN,
+    TIMESTAMP_DOMAIN_UNIX_EPOCH_NS,
+    TIMESTAMP_DOMAIN_MEDIA_TIME_NS,
+    SOURCE_INFO_FLAG_CAN_SEEK,
+    SOURCE_INFO_FLAG_AUTO_LOOP,
+    SOURCE_INFO_FLAG_HAS_DEPTH,
+    SOURCE_INFO_FLAG_HAS_BODY,
+    SOURCE_INFO_FLAG_CAN_RECORD,
+    RECORDING_FORMAT_UNKNOWN,
+    RECORDING_FORMAT_SVO,
+    RECORDING_STATUS_FLAG_CAN_RECORD,
+    RECORDING_STATUS_FLAG_IS_RECORDING,
+    RECORDING_STATUS_FLAG_IS_PAUSED,
+    RECORDING_STATUS_FLAG_LAST_FRAME_OK,
     MODULE_STATUS_OFFLINE,
     MODULE_STATUS_STREAM_RESET,
     unmarshal_frame_metadata,
@@ -54,6 +90,18 @@ FrameMetadataAny = FrameMetadata | FrameMetadataV2
 _INSTANCE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,22})$")
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,31})$")
 _UNIX_PATH_MAX = 107
+_CONTROL_RESPONSE_LABELS = {
+    CONTROL_RESPONSE_OK: "OK",
+    CONTROL_RESPONSE_UNKNOWN_CMD: "UNKNOWN_CMD",
+    CONTROL_RESPONSE_ERROR: "ERROR",
+    CONTROL_RESPONSE_INVALID_MAGIC: "INVALID_MAGIC",
+    CONTROL_RESPONSE_INVALID_LABEL: "INVALID_LABEL",
+    CONTROL_RESPONSE_INVALID_VERSION: "INVALID_VERSION",
+    CONTROL_RESPONSE_INVALID_MSG_SIZE: "INVALID_MSG_SIZE",
+    CONTROL_RESPONSE_UNSUPPORTED: "UNSUPPORTED",
+    CONTROL_RESPONSE_INVALID_PAYLOAD: "INVALID_PAYLOAD",
+    CONTROL_RESPONSE_OUT_OF_RANGE: "OUT_OF_RANGE",
+}
 
 
 class _ResolvedTarget(NamedTuple):
@@ -145,6 +193,11 @@ def _resolve_target(name_or_uri: str) -> _ResolvedTarget:
     )
 
 
+def _format_control_failure(command_name: str, response_code: int) -> str:
+    label = _CONTROL_RESPONSE_LABELS.get(response_code, "UNKNOWN")
+    return f"{command_name} failed with {label} ({response_code})"
+
+
 # Re-export message types for convenience
 __all__ = [
     "CvMmapClient",
@@ -166,6 +219,45 @@ __all__ = [
     "ModuleStatusMessage",
     "ControlMessageRequest",
     "ControlMessageResponse",
+    "SourceInfo",
+    "SeekTimestampRequest",
+    "SeekResult",
+    "RecordingStartRequest",
+    "RecordingStatus",
+    "CONTROL_MSG_CMD_GENERIC",
+    "CONTROL_MSG_CMD_RESET_FRAME_COUNT",
+    "CONTROL_MSG_CMD_GET_SOURCE_INFO",
+    "CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS",
+    "CONTROL_MSG_CMD_START_RECORDING",
+    "CONTROL_MSG_CMD_STOP_RECORDING",
+    "CONTROL_MSG_CMD_GET_RECORDING_STATUS",
+    "CONTROL_RESPONSE_OK",
+    "CONTROL_RESPONSE_UNKNOWN_CMD",
+    "CONTROL_RESPONSE_ERROR",
+    "CONTROL_RESPONSE_INVALID_MAGIC",
+    "CONTROL_RESPONSE_INVALID_LABEL",
+    "CONTROL_RESPONSE_INVALID_VERSION",
+    "CONTROL_RESPONSE_INVALID_MSG_SIZE",
+    "CONTROL_RESPONSE_UNSUPPORTED",
+    "CONTROL_RESPONSE_INVALID_PAYLOAD",
+    "CONTROL_RESPONSE_OUT_OF_RANGE",
+    "SOURCE_KIND_UNKNOWN",
+    "SOURCE_KIND_LIVE",
+    "SOURCE_KIND_FINITE",
+    "TIMESTAMP_DOMAIN_UNKNOWN",
+    "TIMESTAMP_DOMAIN_UNIX_EPOCH_NS",
+    "TIMESTAMP_DOMAIN_MEDIA_TIME_NS",
+    "SOURCE_INFO_FLAG_CAN_SEEK",
+    "SOURCE_INFO_FLAG_AUTO_LOOP",
+    "SOURCE_INFO_FLAG_HAS_DEPTH",
+    "SOURCE_INFO_FLAG_HAS_BODY",
+    "SOURCE_INFO_FLAG_CAN_RECORD",
+    "RECORDING_FORMAT_UNKNOWN",
+    "RECORDING_FORMAT_SVO",
+    "RECORDING_STATUS_FLAG_CAN_RECORD",
+    "RECORDING_STATUS_FLAG_IS_RECORDING",
+    "RECORDING_STATUS_FLAG_IS_PAUSED",
+    "RECORDING_STATUS_FLAG_LAST_FRAME_OK",
 ]
 
 
@@ -582,6 +674,117 @@ class CvMmapRequestClient:
             command_id=CONTROL_MSG_CMD_RESET_FRAME_COUNT,
             timeout_ms=timeout_ms,
         )
+
+    async def get_source_info(self, timeout_ms: int = 5000) -> SourceInfo:
+        """
+        Query source kind, timeline, and capability flags from the producer.
+
+        Raises
+        ------
+        RuntimeError
+            If the producer returns a non-OK response code.
+        ValueError
+            If the response payload is malformed.
+        """
+        response = await self.send_request(
+            command_id=CONTROL_MSG_CMD_GET_SOURCE_INFO,
+            timeout_ms=timeout_ms,
+        )
+        if response.response_code != CONTROL_RESPONSE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "GET_SOURCE_INFO", response.response_code
+                )
+            )
+        return SourceInfo.unmarshal(response.response_message)
+
+    async def seek_timestamp_ns(
+        self, target_timestamp_ns: int, timeout_ms: int = 5000
+    ) -> SeekResult:
+        """
+        Seek a finite source to the first sample whose timestamp is >= target.
+
+        Raises
+        ------
+        RuntimeError
+            If the producer returns a non-OK response code.
+        ValueError
+            If the response payload is malformed.
+        """
+        request = SeekTimestampRequest(target_timestamp_ns=target_timestamp_ns)
+        response = await self.send_request(
+            command_id=CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS,
+            request_message=request.marshal(),
+            timeout_ms=timeout_ms,
+        )
+        if response.response_code != CONTROL_RESPONSE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "SEEK_TIMESTAMP_NS", response.response_code
+                )
+            )
+        return SeekResult.unmarshal(response.response_message)
+
+    async def start_recording(
+        self, output_path: str, timeout_ms: int = 5000
+    ) -> RecordingStatus:
+        """
+        Start backend-managed recording at the given output path.
+
+        Raises
+        ------
+        RuntimeError
+            If the producer returns a non-OK response code.
+        ValueError
+            If the request or response payload is malformed.
+        """
+        request = RecordingStartRequest(output_path=output_path)
+        response = await self.send_request(
+            command_id=CONTROL_MSG_CMD_START_RECORDING,
+            request_message=request.marshal(),
+            timeout_ms=timeout_ms,
+        )
+        if response.response_code != CONTROL_RESPONSE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "START_RECORDING", response.response_code
+                )
+            )
+        return RecordingStatus.unmarshal(response.response_message)
+
+    async def stop_recording(self, timeout_ms: int = 5000) -> RecordingStatus:
+        """
+        Stop backend-managed recording and return the final status snapshot.
+        """
+        response = await self.send_request(
+            command_id=CONTROL_MSG_CMD_STOP_RECORDING,
+            timeout_ms=timeout_ms,
+        )
+        if response.response_code != CONTROL_RESPONSE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "STOP_RECORDING", response.response_code
+                )
+            )
+        return RecordingStatus.unmarshal(response.response_message)
+
+    async def get_recording_status(
+        self, timeout_ms: int = 5000
+    ) -> RecordingStatus:
+        """
+        Query backend-managed recording status.
+        """
+        response = await self.send_request(
+            command_id=CONTROL_MSG_CMD_GET_RECORDING_STATUS,
+            timeout_ms=timeout_ms,
+        )
+        if response.response_code != CONTROL_RESPONSE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "GET_RECORDING_STATUS", response.response_code
+                )
+            )
+        return RecordingStatus.unmarshal(response.response_message)
 
     def close(self):
         """Close the ZMQ socket."""
