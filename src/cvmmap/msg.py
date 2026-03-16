@@ -32,6 +32,8 @@ CONTROL_RESPONSE_INVALID_MSG_SIZE = -6
 CONTROL_RESPONSE_UNSUPPORTED = -7
 CONTROL_RESPONSE_INVALID_PAYLOAD = -8
 CONTROL_RESPONSE_OUT_OF_RANGE = -9
+CONTROL_RESPONSE_TIMEOUT = -100
+CONTROL_RESPONSE_TIMEOUT = -100
 
 MODULE_STATUS_ONLINE = 0xA1
 MODULE_STATUS_OFFLINE = 0xA0
@@ -59,6 +61,8 @@ SOURCE_INFO_FLAG_CAN_RECORD = 0x00000010
 
 RECORDING_FORMAT_UNKNOWN = 0
 RECORDING_FORMAT_SVO = 1
+RECORDING_FORMAT_MCAP = 2
+RECORDING_FORMAT_MCAP = 2
 
 RECORDING_STATUS_FLAG_CAN_RECORD = 0x0001
 RECORDING_STATUS_FLAG_IS_RECORDING = 0x0002
@@ -1269,6 +1273,40 @@ class SeekResult:
 
 
 @dataclass
+class ControlCapabilities:
+    can_seek: bool
+    available_recording_formats: list[int]
+
+    def supports_recording_format(self, recording_format: int) -> bool:
+        return recording_format in self.available_recording_formats
+
+
+@dataclass
+class SvoRecordingOptions:
+    compression_mode: str | None = None
+    bitrate: int | None = None
+    target_framerate: int | None = None
+    transcode_streaming_input: bool | None = None
+
+
+@dataclass
+class McapRecordingOptions:
+    compression: str | None = None
+    topic: str | None = None
+    depth_topic: str | None = None
+    body_topic: str | None = None
+    frame_id: str | None = None
+
+
+@dataclass
+class RecordingRequest:
+    recording_format: int
+    output_path: str
+    svo_options: SvoRecordingOptions | None = None
+    mcap_options: McapRecordingOptions | None = None
+
+
+@dataclass
 class RecordingStartRequest:
     output_path: str
     flags: int = 0
@@ -1305,6 +1343,8 @@ class RecordingStatus:
     active_path: str
     frames_ingested: int
     frames_encoded: int
+    error_message: str = ""
+    error_message: str = ""
 
     PACK_FMT = "<HBBHHIII"
 

@@ -1,6 +1,12 @@
 # cvmmap-client
 
-Python client library for the `cv-mmap` producer protocol (shared memory + ZeroMQ signaling).
+Python client library for the `cv-mmap` producer protocol.
+
+The transport split is:
+
+- shared memory for image payloads
+- ZeroMQ PUB/SUB for frame sync
+- NATS for control, module status, and body tracking
 
 ## Install
 
@@ -41,8 +47,8 @@ The default conventions are:
 
 - shared memory name: `cvmmap_{name}`
 - frame topic endpoint: `ipc:///tmp/cvmmap_{name}`
-- body topic endpoint: `ipc:///tmp/cvmmap_{name}_body`
-- control endpoint: `ipc:///tmp/cvmmap_{name}_control`
+- NATS target key: `cvmmap_{name}`
+- default NATS server URL: `nats://localhost:4222`
 
 ## CVMMAP URI scheme
 
@@ -59,9 +65,8 @@ Defaults:
 Mapping:
 
 - `base_name = <namespace>_<instance>`
+- `nats_target_key = <base_name>` with `.` normalized to `_`
 - frame endpoint: `ipc://<prefix>/<base_name>`
-- body endpoint: `ipc://<prefix>/<base_name>_body`
-- control endpoint: `ipc://<prefix>/<base_name>_control`
 - shared memory name: `<base_name>` (Linux path `/dev/shm/<base_name>`)
 
 Examples:
@@ -73,7 +78,7 @@ Examples:
 ## Development notes
 
 - `uv.lock` is optional for a library project. Keep it if you want reproducible contributor/test environments.
-- Runtime dependencies are intentionally minimal (`numpy`, `pyzmq`).
+- Runtime dependencies are intentionally small (`numpy`, `pyzmq`, `protobuf`, `nats-py`).
 - Tooling dependencies (OpenCV, click, loguru, anyio) are in optional extras.
 
 ## Local examples
@@ -90,20 +95,13 @@ This client stays aligned with producer-side IPC structures.
 | Component | Supported Versions | Notes |
 |-----------|-------------------|-------|
 | SHM Metadata | v1, v2 | Auto-detects from header magic and version fields |
-| Control Wire | v1 | Supports `RESET_FRAME_COUNT`, `GET_SOURCE_INFO`, `SEEK_TIMESTAMP_NS`, `START_RECORDING`, `STOP_RECORDING`, and `GET_RECORDING_STATUS` |
-| Sync Wire | v1 | ZMQ pub/sub framing unchanged |
+| Control/Status | protobuf over NATS | Supports `RESET_FRAME_COUNT`, `GET_SOURCE_INFO`, `GET_CAPABILITIES`, `SEEK_TIMESTAMP_NS`, `START_RECORDING`, `STOP_RECORDING`, and `GET_RECORDING_STATUS` |
+| Body Tracking | raw `cvmmap_body_tracking_v1` bytes over NATS | Same payload format as the producer body packet |
+| Sync Wire | v1 over ZMQ | Frame notification only |
 
 ### Migration window notes
 
-During the migration window, the producer may emit SHM v2 metadata while maintaining control/sync compatibility at v1. This is the intended mixed state.
-
-Control wire layout note:
-
-- request wire header: 34 bytes
-- response wire header: 38 bytes
-- producer C++ envelope structs are 36/40 bytes because of unsent tail padding after the flexible-array length field
-
-This client follows the actual on-wire layout and stays aligned with the upstream Kaitai schema in `cv-mmap/docs/cvmmap_control_v1.ksy`.
+During the migration window, the producer may emit SHM v2 metadata while keeping the frame sync wire unchanged and moving control/body to NATS. This client follows that split directly.
 
 Cross-repo compatibility tests can consume C++-generated fixtures directly from
 `cv-mmap/core/fixtures/protocol`. Override the location with
@@ -146,8 +144,8 @@ packets with a zeroed byte remain valid and surface as `DEPTH_UNIT_UNKNOWN`.
 
 ### Body tracking substream
 
-Body tracking is published on a separate PUB/SUB socket and does not change the
-existing frame iterator:
+Body tracking is published on a NATS subject and does not change the existing
+frame iterator:
 
 ```python
 from cvmmap import CvMmapClient
@@ -161,16 +159,30 @@ async for body_frame in client.body_stream():
 ### Control requests
 
 ```python
-from cvmmap import CvMmapRequestClient
+from cvmmap import (
+    CvMmapRequestClient,
+    RecordingRequest,
+    SvoRecordingOptions,
+    RECORDING_FORMAT_SVO,
+)
 
 client = CvMmapRequestClient("default")
 info = await client.get_source_info()
 print(info.source_kind, info.can_seek, info.can_record)
 
+caps = await client.get_capabilities()
+print(caps.can_seek, caps.available_recording_formats)
+
 result = await client.seek_timestamp_ns(info.timeline_start_ns)
 print(result.landed_timestamp_ns, result.exact_match)
 
-status = await client.start_recording("/tmp/example.svo2")
+status = await client.start_recording(
+    RecordingRequest(
+        recording_format=RECORDING_FORMAT_SVO,
+        output_path="/tmp/example.svo2",
+        svo_options=SvoRecordingOptions(compression_mode="h265"),
+    )
+)
 print(status.is_recording, status.active_path)
 
 status = await client.stop_recording()

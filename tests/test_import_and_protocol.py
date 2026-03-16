@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 cvmmap = import_module("cvmmap")
 cvmmap_msg = import_module("cvmmap.msg")
+control_pb2 = import_module("cvmmap.control_pb2")
 
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "protocol"
@@ -383,39 +384,32 @@ def test_cpp_control_recording_fixtures_parse() -> None:
 
 
 def test_request_client_recording_methods() -> None:
-    payload = struct.pack(
-        cvmmap.RecordingStatus.PACK_FMT,
-        cvmmap.RecordingStatus.size(),
-        cvmmap.RECORDING_FORMAT_SVO,
-        0,
-        cvmmap.RECORDING_STATUS_FLAG_CAN_RECORD
-        | cvmmap.RECORDING_STATUS_FLAG_IS_RECORDING,
-        len(b"/tmp/test.svo2"),
-        10,
-        9,
-        0,
-    ) + b"/tmp/test.svo2"
-
     async def _run() -> None:
         client = object.__new__(cvmmap.CvMmapRequestClient)
-        client._sock = None  # type: ignore[attr-defined]
+        client._target_key = "cvmmap_example"  # type: ignore[attr-defined]
+        client._nats = None  # type: ignore[attr-defined]
 
-        async def _ok_send_request(
-            command_id: int, request_message: bytes = b"", timeout_ms: int = 5000
-        ) -> cvmmap.ControlMessageResponse:
-            if command_id == cvmmap.CONTROL_MSG_CMD_START_RECORDING:
-                assert (
-                    request_message
-                    == cvmmap.RecordingStartRequest("/tmp/test.svo2").marshal()
-                )
-            return cvmmap.ControlMessageResponse(
-                command_id=command_id,
-                response_code=cvmmap.CONTROL_RESPONSE_OK,
-                label="example",
-                response_message=payload,
-            )
+        async def _ok_request_pb(
+            subject: str,
+            request_message,
+            response_type,
+            timeout_ms: int,
+        ):
+            assert timeout_ms == 5000
+            if subject.endswith(".start"):
+                assert subject == "cvmmap.cvmmap_example.control.recorder.svo.start"
+                assert request_message.output_path == "/tmp/test.svo2"
+            response = response_type()
+            response.error = control_pb2.ERROR_CODE_OK
+            response.format = control_pb2.RECORDING_FORMAT_SVO
+            response.can_record = True
+            response.is_recording = True
+            response.frames_ingested = 10
+            response.frames_encoded = 9
+            response.active_path = "/tmp/test.svo2"
+            return response
 
-        client.send_request = _ok_send_request  # type: ignore[method-assign]
+        client._request_pb = _ok_request_pb  # type: ignore[method-assign]
 
         started = await client.start_recording("/tmp/test.svo2")
         assert started.is_recording is True
@@ -427,23 +421,63 @@ def test_request_client_recording_methods() -> None:
         status = await client.get_recording_status()
         assert status.frames_encoded == 9
 
-        async def _error_send_request(
-            command_id: int, request_message: bytes = b"", timeout_ms: int = 5000
-        ) -> cvmmap.ControlMessageResponse:
-            return cvmmap.ControlMessageResponse(
-                command_id=command_id,
-                response_code=cvmmap.CONTROL_RESPONSE_UNSUPPORTED,
-                label="example",
-                response_message=b"",
-            )
+        async def _error_request_pb(
+            subject: str,
+            request_message,
+            response_type,
+            timeout_ms: int,
+        ):
+            response = response_type()
+            response.error = control_pb2.ERROR_CODE_UNSUPPORTED
+            return response
 
-        client.send_request = _error_send_request  # type: ignore[method-assign]
+        client._request_pb = _error_request_pb  # type: ignore[method-assign]
         try:
             await client.get_recording_status()
         except RuntimeError as exc:
             assert "GET_RECORDING_STATUS failed with UNSUPPORTED (-7)" == str(exc)
         else:
             raise AssertionError("Expected get_recording_status() to raise")
+
+    asyncio.run(_run())
+
+
+def test_request_client_capabilities_merge() -> None:
+    async def _run() -> None:
+        client = object.__new__(cvmmap.CvMmapRequestClient)
+        client._target_key = "cvmmap_example"  # type: ignore[attr-defined]
+        client._nats = None  # type: ignore[attr-defined]
+
+        async def _request_pb(
+            subject: str,
+            request_message,
+            response_type,
+            timeout_ms: int,
+        ):
+            response = response_type()
+            response.error = control_pb2.ERROR_CODE_OK
+            if subject.endswith(".source.capabilities"):
+                response.can_seek = False
+            elif subject.endswith(".recorder.svo.capabilities"):
+                response.available_recording_formats.append(
+                    control_pb2.RECORDING_FORMAT_SVO
+                )
+            elif subject.endswith(".recorder.mcap.capabilities"):
+                response.available_recording_formats.append(
+                    control_pb2.RECORDING_FORMAT_MCAP
+                )
+            return response
+
+        client._request_pb = _request_pb  # type: ignore[method-assign]
+
+        capabilities = await client.get_capabilities()
+        assert capabilities.can_seek is False
+        assert capabilities.available_recording_formats == [
+            cvmmap.RECORDING_FORMAT_SVO,
+            cvmmap.RECORDING_FORMAT_MCAP,
+        ]
+        assert capabilities.supports_recording_format(cvmmap.RECORDING_FORMAT_SVO)
+        assert capabilities.supports_recording_format(cvmmap.RECORDING_FORMAT_MCAP)
 
     asyncio.run(_run())
 
@@ -644,14 +678,16 @@ def test_uri_target_defaults() -> None:
     client = cvmmap.CvMmapClient("cvmmap://example")
     assert client.shm_name == "cvmmap_example"
     assert client.zmq_addr == "ipc:///tmp/cvmmap_example"
-    assert client.zmq_body_addr == "ipc:///tmp/cvmmap_example_body"
+    assert client.nats_target_key == "cvmmap_example"
+    client.close()
 
 
 def test_uri_target_custom_prefix_namespace() -> None:
     client = cvmmap.CvMmapClient("cvmmap://camera0@/run/cvmmap?namespace=zed")
     assert client.shm_name == "zed_camera0"
     assert client.zmq_addr == "ipc:///run/cvmmap/zed_camera0"
-    assert client.zmq_body_addr == "ipc:///run/cvmmap/zed_camera0_body"
+    assert client.nats_target_key == "zed_camera0"
+    client.close()
 
 
 def test_plain_name_rejects_uri_chars() -> None:
@@ -674,7 +710,8 @@ def test_uri_fixture_conformance() -> None:
         assert client._base_name == case["base_name"]
         assert client.shm_name == case["shm_name"]
         assert client.zmq_addr == case["zmq_addr"]
-        assert client.zmq_body_addr == case["zmq_body_addr"]
+        assert client.nats_target_key == case["nats_target_key"]
+        client.close()
 
     for case in fixture["invalid_cases"]:
         try:
