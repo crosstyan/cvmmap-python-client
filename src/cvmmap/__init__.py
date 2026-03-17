@@ -427,10 +427,12 @@ def _schedule_nats_close(client: Any | None) -> None:
 
 
 class _NatsMixin:
-    _nats_url: str
+    _nats_url: str | None
     _nats: Any | None
 
     async def _ensure_nats(self) -> Any:
+        if self._nats_url is None:
+            raise RuntimeError("NATS is disabled for this client")
         if self._nats is None:
             nats = _import_nats()
             self._nats = await nats.connect(servers=[self._nats_url])
@@ -447,7 +449,7 @@ class CvMmapClient(_NatsMixin):
 
     _SHM_PAYLOAD_OFFSET: int = 256
 
-    def __init__(self, name_or_uri: str, *, nats_url: str = DEFAULT_NATS_URL):
+    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
         resolved = _resolve_target(name_or_uri)
         self._name = resolved.instance
         self._prefix = resolved.prefix
@@ -504,6 +506,8 @@ class CvMmapClient(_NatsMixin):
         self._status_subscription_ready = True
 
     def body_stream(self) -> "CvMmapBodyStream":
+        if self._nats_url is None:
+            raise RuntimeError("NATS is disabled for this client")
         return CvMmapBodyStream(self._name_or_uri, nats_url=self._nats_url)
 
     def _read_metadata(self) -> FrameMetadataAny:
@@ -576,33 +580,37 @@ class CvMmapClient(_NatsMixin):
         self._read_metadata()
 
     async def __aiter__(self) -> AsyncGenerator[tuple[NDArray, FrameMetadataAny], None]:
-        await self._ensure_status_subscription()
+        if self._nats_url is not None:
+            await self._ensure_status_subscription()
 
         while True:
             assert self._sock is not None, "Client socket is closed"
-            recv_task = asyncio.create_task(self._sock.recv())
-            status_task = asyncio.create_task(self._status_queue.get())
-            done: set[asyncio.Task[Any]] = set()
-            pending: set[asyncio.Task[Any]] = set()
-            try:
-                done, pending = await asyncio.wait(
-                    {recv_task, status_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            finally:
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with suppress(asyncio.CancelledError):
-                        await task
+            if self._nats_url is None:
+                message = cast(bytes, await self._sock.recv())
+            else:
+                recv_task = asyncio.create_task(self._sock.recv())
+                status_task = asyncio.create_task(self._status_queue.get())
+                done: set[asyncio.Task[Any]] = set()
+                pending: set[asyncio.Task[Any]] = set()
+                try:
+                    done, pending = await asyncio.wait(
+                        {recv_task, status_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in pending:
+                        task.cancel()
+                    for task in pending:
+                        with suppress(asyncio.CancelledError):
+                            await task
 
-            if status_task in done:
-                status = int(status_task.result())
-                if status in (MODULE_STATUS_OFFLINE, MODULE_STATUS_STREAM_RESET):
-                    return
-                continue
+                if status_task in done:
+                    status = int(status_task.result())
+                    if status in (MODULE_STATUS_OFFLINE, MODULE_STATUS_STREAM_RESET):
+                        return
+                    continue
 
-            message = cast(bytes, recv_task.result())
+                message = cast(bytes, recv_task.result())
             if len(message) < 1:
                 raise RuntimeError("Received empty message")
             if message[0] != FRAME_TOPIC_MAGIC:
@@ -633,7 +641,7 @@ class CvMmapClient(_NatsMixin):
 class CvMmapBodyStream(_NatsMixin):
     """Async iterator over raw body-tracking payloads delivered via NATS."""
 
-    def __init__(self, name_or_uri: str, *, nats_url: str = DEFAULT_NATS_URL):
+    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
         resolved = _resolve_target(name_or_uri)
         self._name = resolved.instance
         self._target_key = resolved.nats_target_key
@@ -727,7 +735,7 @@ class CvMmapConfig(TypedDict):
 class CvMmapRequestClient(_NatsMixin):
     """NATS request/reply control client."""
 
-    def __init__(self, name_or_uri: str, *, nats_url: str = DEFAULT_NATS_URL):
+    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
         resolved = _resolve_target(name_or_uri)
         self._name = resolved.instance
         self._prefix = resolved.prefix
