@@ -588,10 +588,10 @@ class CvMmapClient(_NatsMixin):
             if self._nats_url is None:
                 message = cast(bytes, await self._sock.recv())
             else:
-                recv_task = asyncio.create_task(self._sock.recv())
+                recv_task = asyncio.ensure_future(self._sock.recv())
                 status_task = asyncio.create_task(self._status_queue.get())
-                done: set[asyncio.Task[Any]] = set()
-                pending: set[asyncio.Task[Any]] = set()
+                done: set[asyncio.Future[Any]] = set()
+                pending: set[asyncio.Future[Any]] = set()
                 try:
                     done, pending = await asyncio.wait(
                         {recv_task, status_task},
@@ -683,8 +683,8 @@ class CvMmapBodyStream(_NatsMixin):
         while True:
             body_task = asyncio.create_task(self._body_queue.get())
             status_task = asyncio.create_task(self._status_queue.get())
-            done: set[asyncio.Task[Any]] = set()
-            pending: set[asyncio.Task[Any]] = set()
+            done: set[asyncio.Future[Any]] = set()
+            pending: set[asyncio.Future[Any]] = set()
             try:
                 done, pending = await asyncio.wait(
                     {body_task, status_task},

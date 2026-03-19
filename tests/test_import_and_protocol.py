@@ -75,6 +75,21 @@ class _FakeSharedMemory:
         self.buf = memoryview(data)
 
 
+class _FutureReturningSocket:
+    def __init__(self, message: bytes) -> None:
+        self._message = message
+        self.closed = False
+
+    def recv(self) -> asyncio.Future[bytes]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[bytes] = loop.create_future()
+        future.set_result(self._message)
+        return future
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_import_core_symbols() -> None:
     assert getattr(cvmmap, "CvMmapClient") is not None
     assert getattr(cvmmap, "FrameInfo") is not None
@@ -645,6 +660,36 @@ def test_client_depth_unit_helper() -> None:
         assert client.depth_unit(metadata) == cvmmap.DEPTH_UNIT_MILLIMETER
     finally:
         client._sock.close()
+
+
+def test_client_async_iterator_accepts_future_returning_recv() -> None:
+    client = cvmmap.CvMmapClient("example")
+    original_sock = client._sock
+    metadata_region = _load_fixture_bytes("v2_left_depth_valid_metadata.hex")
+    payload = _load_fixture_bytes("v2_left_depth_valid_payload.hex")
+    sync_message = cvmmap.SyncMessage(
+        frame_count=1,
+        timestamp_ns=123456789,
+        label="example",
+    )
+
+    original_sock.close()
+    client._sock = _FutureReturningSocket(sync_message.marshal())
+    client._shm = _FakeSharedMemory(metadata_region + payload)
+    client._status_subscription_ready = True
+
+    async def _run() -> None:
+        frame, metadata = await anext(client.__aiter__())
+        assert frame.shape == (2, 2, 3)
+        assert frame[1, 1].tolist() == [10, 11, 12]
+        depth = client.depth_plane(metadata)
+        assert depth is not None
+        assert np.isclose(depth[0, 0], 1.5)
+
+    try:
+        asyncio.run(_run())
+    finally:
+        client.close()
 
 
 def test_invalid_v2_depth_unit_rejected() -> None:
