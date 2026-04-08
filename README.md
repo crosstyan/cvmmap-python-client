@@ -7,6 +7,7 @@ The transport split is:
 - shared memory for image payloads
 - ZeroMQ PUB/SUB for frame sync
 - NATS for control, module status, and body tracking
+- NATS Micro service discovery when enabled on the producer
 
 ## Install
 
@@ -43,12 +44,24 @@ client = CvMmapClient("cvmmap://default")
 client = CvMmapClient("cvmmap://cam0@/run/cvmmap?namespace=zed")
 ```
 
+Discovery is also supported:
+
+```python
+from cvmmap import CvMmapClient, discover_cvmmap_producer
+
+producer = await discover_cvmmap_producer(instance_name="zed4")
+client = CvMmapClient(producer)
+```
+
 The default conventions are:
 
 - shared memory name: `cvmmap_{name}`
 - frame topic endpoint: `ipc:///tmp/cvmmap_{name}`
 - NATS target key: `cvmmap_{name}`
 - default NATS server URL: `nats://localhost:4222`
+
+For discovered producers, the client uses the producer-advertised transport
+metadata instead of recomputing these values locally.
 
 ## CVMMAP URI scheme
 
@@ -74,6 +87,47 @@ Examples:
 - `default` -> `ipc:///tmp/cvmmap_default`, shm `cvmmap_default`
 - `cvmmap://default` -> `ipc:///tmp/cvmmap_default`, shm `cvmmap_default`
 - `cvmmap://camera0@/run/cvmmap?namespace=zed` -> `ipc:///run/cvmmap/zed_camera0`, shm `zed_camera0`
+
+## NATS discovery
+
+When the producer runs with `nats.enabled = true`, it advertises itself as the
+NATS Micro service `cvmmap.producer`.
+
+Discovery subjects:
+
+- `$SRV.PING.cvmmap.producer`
+- `$SRV.INFO.cvmmap.producer.<service-id>`
+- `$SRV.STATS.cvmmap.producer.<service-id>`
+
+Python discovery APIs:
+
+- `discover_cvmmap_producers(...)`
+- `discover_cvmmap_producer(...)`
+
+Discovered producers expose the advertised connect metadata through
+`DiscoveredProducer`, including:
+
+- `instance_name`
+- `nats_target_key`
+- `shm_name`
+- `zmq_addr`
+- `body_subject`
+- `status_subject`
+- `control_subject_prefix`
+- `backend`
+
+Compatibility rules:
+
+- the existing live subjects `cvmmap.<target>.control.*`, `.body`, and `.status` remain unchanged
+- discovery is additive and only helps clients find producers
+- existing manual target forms still work
+- producers with `nats.enabled = false` are not discoverable over NATS
+
+Connection modes:
+
+- manual target: `CvMmapClient("default")`
+- discovered full transport: `CvMmapClient(await discover_cvmmap_producer(...))`
+- discovered ZeroMQ-only video: `CvMmapClient(await discover_cvmmap_producer(...), nats_url=None)`
 
 ## Development notes
 
@@ -155,6 +209,8 @@ async for body_frame in client.body_stream():
     for body in body_frame.bodies:
         print(body.id, body.position)
 ```
+
+The body stream and request client also accept a `DiscoveredProducer` object.
 
 ### Control requests
 

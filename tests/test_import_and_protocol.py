@@ -93,6 +93,8 @@ class _FutureReturningSocket:
 def test_import_core_symbols() -> None:
     assert getattr(cvmmap, "CvMmapClient") is not None
     assert getattr(cvmmap, "FrameInfo") is not None
+    assert getattr(cvmmap, "DiscoveredProducer") is not None
+    assert getattr(cvmmap, "discover_cvmmap_producers") is not None
 
 
 def test_sync_message_roundtrip() -> None:

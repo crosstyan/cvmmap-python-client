@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
+import json
 from logging import getLogger
 import importlib
 import re
@@ -91,6 +93,7 @@ from .msg import (
 from .nats_subjects import (
     DEFAULT_NATS_URL,
     subject_body,
+    subject_control_prefix,
     subject_control_recorder_mcap_capabilities,
     subject_control_recorder_mcap_start,
     subject_control_recorder_mcap_status,
@@ -141,6 +144,9 @@ _PROTO_TO_MODULE_STATUS = {
     control_pb2.MODULE_STATUS_CODE_OFFLINE: MODULE_STATUS_OFFLINE,
     control_pb2.MODULE_STATUS_CODE_STREAM_RESET: MODULE_STATUS_STREAM_RESET,
 }
+_DISCOVERY_SERVICE_NAME = "cvmmap.producer"
+_DISCOVERY_PING_SUBJECT = f"$SRV.PING.{_DISCOVERY_SERVICE_NAME}"
+_DISCOVERY_INFO_SUBJECT_TEMPLATE = f"$SRV.INFO.{_DISCOVERY_SERVICE_NAME}" + ".{}"
 
 
 class _ResolvedTarget(NamedTuple):
@@ -149,6 +155,47 @@ class _ResolvedTarget(NamedTuple):
     prefix: str
     base_name: str
     nats_target_key: str
+
+
+class _ResolvedClientTarget(NamedTuple):
+    instance: str
+    namespace: str
+    prefix: str
+    base_name: str
+    nats_target_key: str
+    shm_name: str
+    zmq_addr: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredProducer:
+    service_id: str
+    service_name: str
+    service_version: str
+    instance_name: str
+    namespace: str = ""
+    ipc_prefix: str = ""
+    base_name: str = ""
+    nats_target_key: str = ""
+    shm_name: str = ""
+    zmq_addr: str = ""
+    body_subject: str = ""
+    status_subject: str = ""
+    control_subject_prefix: str = ""
+    backend: str = ""
+    control_subjects: tuple[str, ...] = ()
+
+
+class DiscoveryError(RuntimeError):
+    """Base error for cvmmap producer discovery failures."""
+
+
+class DiscoveryNotFoundError(DiscoveryError):
+    """Raised when a discovery query returns no matching producer."""
+
+
+class DiscoveryAmbiguousError(DiscoveryError):
+    """Raised when a discovery query returns multiple matching producers."""
 
 
 def _validate_prefix(prefix: str) -> str:
@@ -231,6 +278,169 @@ def _resolve_target(name_or_uri: str) -> _ResolvedTarget:
         prefix=normalized_prefix,
         base_name=base_name,
         nats_target_key=base_name.replace(".", "_"),
+    )
+
+
+def _resolve_client_target(
+    name_or_producer: str | DiscoveredProducer,
+) -> _ResolvedClientTarget:
+    if isinstance(name_or_producer, DiscoveredProducer):
+        if not name_or_producer.instance_name:
+            raise ValueError("discovered producer is missing instance_name")
+        if not name_or_producer.shm_name:
+            raise ValueError("discovered producer is missing shm_name")
+        if not name_or_producer.zmq_addr:
+            raise ValueError("discovered producer is missing zmq_addr")
+
+        prefix = name_or_producer.ipc_prefix
+        if not prefix and name_or_producer.zmq_addr.startswith("ipc://"):
+            ipc_path = name_or_producer.zmq_addr[len("ipc://") :]
+            slash = ipc_path.rfind("/")
+            if slash > 0:
+                prefix = ipc_path[:slash]
+
+        return _ResolvedClientTarget(
+            instance=name_or_producer.instance_name,
+            namespace=name_or_producer.namespace,
+            prefix=prefix,
+            base_name=name_or_producer.base_name or name_or_producer.shm_name,
+            nats_target_key=name_or_producer.nats_target_key,
+            shm_name=name_or_producer.shm_name,
+            zmq_addr=name_or_producer.zmq_addr,
+        )
+
+    resolved = _resolve_target(name_or_producer)
+    return _ResolvedClientTarget(
+        instance=resolved.instance,
+        namespace=resolved.namespace,
+        prefix=resolved.prefix,
+        base_name=resolved.base_name,
+        nats_target_key=resolved.nats_target_key,
+        shm_name=resolved.base_name,
+        zmq_addr=f"ipc://{resolved.prefix}/{resolved.base_name}",
+    )
+
+
+def _ensure_target_key(
+    resolved: _ResolvedClientTarget,
+    *,
+    context: str,
+) -> str:
+    if not resolved.nats_target_key:
+        raise ValueError(
+            f"discovered producer is missing nats_target_key for {context}"
+        )
+    return resolved.nats_target_key
+
+
+def _parse_discovery_json(payload: bytes, *, context: str) -> dict[str, Any]:
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise DiscoveryError(
+            f"invalid {context} discovery payload encoding: {exc}"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise DiscoveryError(f"invalid {context} discovery payload: {exc}") from exc
+
+    if not isinstance(decoded, dict):
+        raise DiscoveryError(f"invalid {context} discovery payload: expected object")
+    return decoded
+
+
+def _metadata_str(metadata: dict[str, Any], key: str) -> str:
+    value = metadata.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def _producer_matches_filters(
+    producer: DiscoveredProducer,
+    *,
+    instance_name: str | None,
+    nats_target_key: str | None,
+    backend: str | None,
+) -> bool:
+    if instance_name is not None and producer.instance_name != instance_name:
+        return False
+    if nats_target_key is not None and producer.nats_target_key != nats_target_key:
+        return False
+    if backend is not None and producer.backend != backend:
+        return False
+    return True
+
+
+def _producer_label(producer: DiscoveredProducer) -> str:
+    return producer.instance_name or producer.service_id
+
+
+def _parse_discovered_producer(payload: bytes) -> DiscoveredProducer:
+    data = _parse_discovery_json(payload, context="info")
+    service_name = data.get("name")
+    if not isinstance(service_name, str) or service_name != _DISCOVERY_SERVICE_NAME:
+        raise DiscoveryError(
+            f"unexpected discovery service name: {service_name!r}"
+        )
+
+    service_id = data.get("id")
+    if not isinstance(service_id, str) or not service_id:
+        raise DiscoveryError("invalid discovery info payload: missing id")
+
+    metadata = data.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise DiscoveryError("invalid discovery info payload: metadata must be an object")
+
+    instance_name = _metadata_str(metadata, "instance_name")
+    nats_target_key = _metadata_str(metadata, "nats_target_key")
+    shm_name = _metadata_str(metadata, "shm_name")
+    zmq_addr = _metadata_str(metadata, "zmq_addr")
+    if not instance_name or not nats_target_key or not shm_name or not zmq_addr:
+        raise DiscoveryError(
+            "invalid discovery info payload: missing required cvmmap transport metadata"
+        )
+
+    endpoints_raw = data.get("endpoints")
+    if endpoints_raw is None:
+        endpoints_raw = []
+    if not isinstance(endpoints_raw, list):
+        raise DiscoveryError("invalid discovery info payload: endpoints must be an array")
+
+    control_subjects: list[str] = []
+    for endpoint in endpoints_raw:
+        if not isinstance(endpoint, dict):
+            continue
+        subject = endpoint.get("subject")
+        if isinstance(subject, str) and subject:
+            control_subjects.append(subject)
+
+    control_subjects = sorted(set(control_subjects))
+    body_subject = _metadata_str(metadata, "body_subject") or subject_body(nats_target_key)
+    status_subject = _metadata_str(metadata, "status_subject") or subject_status(
+        nats_target_key
+    )
+    control_prefix = _metadata_str(
+        metadata, "control_subject_prefix"
+    ) or subject_control_prefix(nats_target_key)
+
+    return DiscoveredProducer(
+        service_id=service_id,
+        service_name=service_name,
+        service_version=data.get("version", "")
+        if isinstance(data.get("version"), str)
+        else "",
+        instance_name=instance_name,
+        namespace=_metadata_str(metadata, "namespace"),
+        ipc_prefix=_metadata_str(metadata, "ipc_prefix"),
+        base_name=_metadata_str(metadata, "base_name") or shm_name,
+        nats_target_key=nats_target_key,
+        shm_name=shm_name,
+        zmq_addr=zmq_addr,
+        body_subject=body_subject,
+        status_subject=status_subject,
+        control_subject_prefix=control_prefix,
+        backend=_metadata_str(metadata, "backend"),
+        control_subjects=tuple(control_subjects),
     )
 
 
@@ -444,20 +654,158 @@ class _NatsMixin:
         _schedule_nats_close(client)
 
 
+async def discover_cvmmap_producers(
+    *,
+    nats_url: str = DEFAULT_NATS_URL,
+    instance_name: str | None = None,
+    nats_target_key: str | None = None,
+    backend: str | None = None,
+    timeout_ms: int = 1000,
+) -> list[DiscoveredProducer]:
+    nats = _import_nats()
+    try:
+        nc = await nats.connect(servers=[nats_url])
+    except Exception as exc:
+        raise DiscoveryError(f"failed to connect to NATS at '{nats_url}': {exc}") from exc
+
+    try:
+        inbox = nc.new_inbox()
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        async def _on_ping(message: Any) -> None:
+            await queue.put(bytes(message.data))
+
+        await nc.subscribe(inbox, cb=_on_ping)
+        await nc.flush()
+        await nc.publish(_DISCOVERY_PING_SUBJECT, b"", reply=inbox)
+        await nc.flush()
+
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000.0)
+        service_ids: set[str] = set()
+        malformed_ping_count = 0
+
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except TimeoutError:
+                break
+
+            try:
+                ping = _parse_discovery_json(payload, context="ping")
+            except DiscoveryError as exc:
+                malformed_ping_count += 1
+                getLogger(__name__).warning("%s", exc)
+                continue
+
+            name = ping.get("name")
+            service_id = ping.get("id")
+            if (
+                isinstance(name, str)
+                and name == _DISCOVERY_SERVICE_NAME
+                and isinstance(service_id, str)
+                and service_id
+            ):
+                service_ids.add(service_id)
+
+        producers: list[DiscoveredProducer] = []
+        malformed_info_count = 0
+        for service_id in sorted(service_ids):
+            subject = _DISCOVERY_INFO_SUBJECT_TEMPLATE.format(service_id)
+            try:
+                response = await nc.request(
+                    subject,
+                    b"",
+                    timeout=timeout_ms / 1000.0,
+                )
+            except Exception as exc:
+                if exc.__class__.__name__ == "TimeoutError":
+                    raise DiscoveryError(
+                        f"timed out waiting for discovery info on '{subject}'"
+                    ) from exc
+                raise DiscoveryError(
+                    f"failed to request discovery info on '{subject}': {exc}"
+                ) from exc
+
+            try:
+                producer = _parse_discovered_producer(bytes(response.data))
+            except DiscoveryError as exc:
+                malformed_info_count += 1
+                getLogger(__name__).warning("%s", exc)
+                continue
+
+            if _producer_matches_filters(
+                producer,
+                instance_name=instance_name,
+                nats_target_key=nats_target_key,
+                backend=backend,
+            ):
+                producers.append(producer)
+
+        if not producers and (malformed_ping_count > 0 or malformed_info_count > 0):
+            raise DiscoveryError(
+                "service discovery received malformed cvmmap discovery payloads"
+            )
+
+        return producers
+    finally:
+        with suppress(Exception):
+            await nc.close()
+
+
+async def discover_cvmmap_producer(
+    *,
+    nats_url: str = DEFAULT_NATS_URL,
+    instance_name: str | None = None,
+    nats_target_key: str | None = None,
+    backend: str | None = None,
+    timeout_ms: int = 1000,
+) -> DiscoveredProducer:
+    producers = await discover_cvmmap_producers(
+        nats_url=nats_url,
+        instance_name=instance_name,
+        nats_target_key=nats_target_key,
+        backend=backend,
+        timeout_ms=timeout_ms,
+    )
+    if not producers:
+        raise DiscoveryNotFoundError("no cvmmap producer matched the discovery query")
+    if len(producers) != 1:
+        labels = ", ".join(_producer_label(producer) for producer in producers)
+        raise DiscoveryAmbiguousError(
+            f"discovery query matched {len(producers)} producers: {labels}"
+        )
+    return producers[0]
+
+
 class CvMmapClient(_NatsMixin):
     """Shared-memory frame client with NATS status/body control plane."""
 
     _SHM_PAYLOAD_OFFSET: int = 256
 
-    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
-        resolved = _resolve_target(name_or_uri)
+    def __init__(
+        self,
+        name_or_uri: str | DiscoveredProducer,
+        *,
+        nats_url: str | None = DEFAULT_NATS_URL,
+    ):
+        resolved = _resolve_client_target(name_or_uri)
         self._name = resolved.instance
         self._prefix = resolved.prefix
         self._namespace = resolved.namespace
         self._base_name = resolved.base_name
         self._target_key = resolved.nats_target_key
+        self._shm_name = resolved.shm_name
+        self._zmq_addr = resolved.zmq_addr
         self._nats_url = nats_url
-        self._name_or_uri = name_or_uri
+        self._target = name_or_uri
+
+        if self._nats_url is not None:
+            self._target_key = _ensure_target_key(
+                resolved, context="CvMmapClient NATS control/status"
+            )
 
         self._ctx = Context.instance()
         self._sock = self._ctx.socket(zmq.SUB)
@@ -473,11 +821,11 @@ class CvMmapClient(_NatsMixin):
 
     @property
     def shm_name(self) -> str:
-        return self._base_name
+        return self._shm_name
 
     @property
     def zmq_addr(self) -> str:
-        return f"ipc://{self._prefix}/{self.shm_name}"
+        return self._zmq_addr
 
     @property
     def nats_target_key(self) -> str:
@@ -508,7 +856,7 @@ class CvMmapClient(_NatsMixin):
     def body_stream(self) -> "CvMmapBodyStream":
         if self._nats_url is None:
             raise RuntimeError("NATS is disabled for this client")
-        return CvMmapBodyStream(self._name_or_uri, nats_url=self._nats_url)
+        return CvMmapBodyStream(self._target, nats_url=self._nats_url)
 
     def _read_metadata(self) -> FrameMetadataAny:
         assert self._shm is not None, "Shared memory not attached"
@@ -641,10 +989,17 @@ class CvMmapClient(_NatsMixin):
 class CvMmapBodyStream(_NatsMixin):
     """Async iterator over raw body-tracking payloads delivered via NATS."""
 
-    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
-        resolved = _resolve_target(name_or_uri)
+    def __init__(
+        self,
+        name_or_uri: str | DiscoveredProducer,
+        *,
+        nats_url: str | None = DEFAULT_NATS_URL,
+    ):
+        resolved = _resolve_client_target(name_or_uri)
         self._name = resolved.instance
-        self._target_key = resolved.nats_target_key
+        self._target_key = _ensure_target_key(
+            resolved, context="CvMmapBodyStream body/status transport"
+        )
         self._nats_url = nats_url
         self._nats = None
         self._body_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -735,23 +1090,32 @@ class CvMmapConfig(TypedDict):
 class CvMmapRequestClient(_NatsMixin):
     """NATS request/reply control client."""
 
-    def __init__(self, name_or_uri: str, *, nats_url: str | None = DEFAULT_NATS_URL):
-        resolved = _resolve_target(name_or_uri)
+    def __init__(
+        self,
+        name_or_uri: str | DiscoveredProducer,
+        *,
+        nats_url: str | None = DEFAULT_NATS_URL,
+    ):
+        resolved = _resolve_client_target(name_or_uri)
         self._name = resolved.instance
         self._prefix = resolved.prefix
         self._namespace = resolved.namespace
         self._base_name = resolved.base_name
-        self._target_key = resolved.nats_target_key
+        self._target_key = _ensure_target_key(
+            resolved, context="CvMmapRequestClient request/reply control"
+        )
+        self._shm_name = resolved.shm_name
+        self._zmq_addr = resolved.zmq_addr
         self._nats_url = nats_url
         self._nats = None
 
     @property
     def shm_name(self) -> str:
-        return self._base_name
+        return self._shm_name
 
     @property
     def zmq_addr(self) -> str:
-        return f"ipc://{self._prefix}/{self.shm_name}"
+        return self._zmq_addr
 
     @property
     def nats_target_key(self) -> str:
@@ -1109,6 +1473,10 @@ __all__ = [
     "CvMmapClient",
     "CvMmapConfig",
     "CvMmapRequestClient",
+    "DiscoveredProducer",
+    "DiscoveryAmbiguousError",
+    "DiscoveryError",
+    "DiscoveryNotFoundError",
     "BodyFrame",
     "BodyTrack",
     "BodyTrackingMessageHeader",
@@ -1178,6 +1546,8 @@ __all__ = [
     "TIMESTAMP_DOMAIN_MEDIA_TIME_NS",
     "TIMESTAMP_DOMAIN_UNIX_EPOCH_NS",
     "TIMESTAMP_DOMAIN_UNKNOWN",
+    "discover_cvmmap_producer",
+    "discover_cvmmap_producers",
     "unmarshal_body_tracking_message",
     "unmarshal_frame_metadata",
 ]
