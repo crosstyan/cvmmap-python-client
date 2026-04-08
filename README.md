@@ -91,13 +91,13 @@ Examples:
 ## NATS discovery
 
 When the producer runs with `nats.enabled = true`, it advertises itself as the
-NATS Micro service `cvmmap.producer`.
+NATS Micro service `cvmmap_producer`.
 
 Discovery subjects:
 
-- `$SRV.PING.cvmmap.producer`
-- `$SRV.INFO.cvmmap.producer.<service-id>`
-- `$SRV.STATS.cvmmap.producer.<service-id>`
+- `$SRV.PING.cvmmap_producer`
+- `$SRV.INFO.cvmmap_producer.<service-id>`
+- `$SRV.STATS.cvmmap_producer.<service-id>`
 
 Python discovery APIs:
 

@@ -39,7 +39,7 @@ class _FakeNatsClient:
         return None
 
     async def publish(self, subject: str, payload: bytes, reply: str | None = None) -> None:
-        if subject == "$SRV.PING.cvmmap.producer" and reply is not None:
+        if subject == "$SRV.PING.cvmmap_producer" and reply is not None:
             callback = self._subscriptions[reply]
             for ping_payload in self._ping_payloads:
                 await callback(_FakeMessage(ping_payload))
@@ -65,7 +65,7 @@ class _FakeNatsModule:
 def _ping_payload(service_id: str) -> bytes:
     return json.dumps(
         {
-            "name": "cvmmap.producer",
+            "name": "cvmmap_producer",
             "version": "0.1.0",
             "id": service_id,
             "type": "io.nats.micro.v1.ping_response",
@@ -85,7 +85,7 @@ def _info_payload(
     return json.dumps(
         {
             "type": "io.nats.micro.v1.info_response",
-            "name": "cvmmap.producer",
+            "name": "cvmmap_producer",
             "version": "0.1.0",
             "id": service_id,
             "description": "cv-mmap producer discovery and control service",
@@ -111,7 +111,7 @@ def test_discover_cvmmap_producers_filters_and_fallback_subjects(monkeypatch) ->
     fake_client = _FakeNatsClient(
         ping_payloads=[_ping_payload("svc-1"), _ping_payload("svc-2")],
         info_payloads={
-            "$SRV.INFO.cvmmap.producer.svc-1": _info_payload(
+            "$SRV.INFO.cvmmap_producer.svc-1": _info_payload(
                 "svc-1",
                 instance_name="zed4",
                 target_key="cvmmap_zed4",
@@ -119,7 +119,7 @@ def test_discover_cvmmap_producers_filters_and_fallback_subjects(monkeypatch) ->
                 shm_name="cvmmap_zed4",
                 zmq_addr="ipc:///tmp/cvmmap_zed4",
             ),
-            "$SRV.INFO.cvmmap.producer.svc-2": _info_payload(
+            "$SRV.INFO.cvmmap_producer.svc-2": _info_payload(
                 "svc-2",
                 instance_name="dummy1",
                 target_key="cvmmap_dummy1",
@@ -158,7 +158,7 @@ def test_discover_cvmmap_producer_exact_one_errors(monkeypatch) -> None:
     fake_client = _FakeNatsClient(
         ping_payloads=[_ping_payload("svc-1"), _ping_payload("svc-2")],
         info_payloads={
-            "$SRV.INFO.cvmmap.producer.svc-1": _info_payload(
+            "$SRV.INFO.cvmmap_producer.svc-1": _info_payload(
                 "svc-1",
                 instance_name="zed4",
                 target_key="cvmmap_zed4",
@@ -166,7 +166,7 @@ def test_discover_cvmmap_producer_exact_one_errors(monkeypatch) -> None:
                 shm_name="cvmmap_zed4",
                 zmq_addr="ipc:///tmp/cvmmap_zed4",
             ),
-            "$SRV.INFO.cvmmap.producer.svc-2": _info_payload(
+            "$SRV.INFO.cvmmap_producer.svc-2": _info_payload(
                 "svc-2",
                 instance_name="zed5",
                 target_key="cvmmap_zed5",
@@ -202,7 +202,7 @@ def test_discover_cvmmap_producer_exact_one_errors(monkeypatch) -> None:
 def test_discovered_producer_constructors_preserve_connect_info() -> None:
     producer = cvmmap.DiscoveredProducer(
         service_id="svc-1",
-        service_name="cvmmap.producer",
+        service_name="cvmmap_producer",
         service_version="0.1.0",
         instance_name="zed4",
         namespace="cvmmap",
@@ -233,4 +233,3 @@ def test_discovered_producer_constructors_preserve_connect_info() -> None:
 
     body_stream = cvmmap.CvMmapBodyStream(producer)
     assert body_stream._target_key == "cvmmap_zed4"  # type: ignore[attr-defined]
-
