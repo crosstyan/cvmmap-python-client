@@ -157,8 +157,9 @@ This client stays aligned with producer-side IPC structures.
 
 During the migration window, the producer may emit SHM v2 metadata while keeping the frame sync wire unchanged and moving control/body to NATS. This client follows that split directly.
 
-Cross-repo compatibility tests can consume C++-generated fixtures directly from
-`cv-mmap/core/fixtures/protocol`. Override the location with
+Cross-repo compatibility tests can consume the remaining live C++-generated
+sync/body fixtures directly from `cv-mmap/core/fixtures/protocol`. Override the
+location with
 `CVMMAP_CORE_PROTOCOL_FIXTURE_DIR=/path/to/cv-mmap/core/fixtures/protocol` when
 the sibling repo is not at the default local path.
 

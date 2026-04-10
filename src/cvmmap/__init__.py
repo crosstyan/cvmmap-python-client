@@ -7,7 +7,6 @@ import json
 from logging import getLogger
 import importlib
 import re
-import struct
 from typing import Any, AsyncGenerator, NamedTuple, TypedDict, cast
 
 import numpy as np
@@ -20,24 +19,7 @@ Socket = _zmq_asyncio.Socket
 from . import control_pb2
 from .msg import (
     BODY_TRACKING_MAGIC,
-    CONTROL_MSG_CMD_GENERIC,
-    CONTROL_MSG_CMD_GET_RECORDING_STATUS,
-    CONTROL_MSG_CMD_GET_SOURCE_INFO,
-    CONTROL_MSG_CMD_RESET_FRAME_COUNT,
-    CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS,
-    CONTROL_MSG_CMD_START_RECORDING,
-    CONTROL_MSG_CMD_STOP_RECORDING,
-    CONTROL_RESPONSE_ERROR,
-    CONTROL_RESPONSE_INVALID_LABEL,
-    CONTROL_RESPONSE_INVALID_MAGIC,
-    CONTROL_RESPONSE_INVALID_MSG_SIZE,
-    CONTROL_RESPONSE_INVALID_PAYLOAD,
-    CONTROL_RESPONSE_INVALID_VERSION,
-    CONTROL_RESPONSE_OK,
-    CONTROL_RESPONSE_OUT_OF_RANGE,
-    CONTROL_RESPONSE_TIMEOUT,
-    CONTROL_RESPONSE_UNKNOWN_CMD,
-    CONTROL_RESPONSE_UNSUPPORTED,
+    ControlErrorCode,
     CV_MMAP_MAGIC,
     CV_MMAP_MAGIC_LEN,
     DEPTH_UNIT_METER,
@@ -50,19 +32,15 @@ from .msg import (
     BodyTrack,
     BodyTrackingMessageHeader,
     ControlCapabilities,
-    ControlMessageRequest,
-    ControlMessageResponse,
     FrameInfo,
     FrameMetadata,
     FrameMetadataV2,
     FrameMetadataV2Header,
     FramePlaneDescriptorV2,
-    ModuleStatusMessage,
+    ModuleStatus,
     RecordingRequest,
-    RecordingStartRequest,
     RecordingStatus,
     SeekResult,
-    SeekTimestampRequest,
     SourceInfo,
     SyncMessage,
     SvoRecordingOptions,
@@ -74,12 +52,10 @@ from .msg import (
     SOURCE_INFO_FLAG_CAN_SEEK,
     SOURCE_INFO_FLAG_HAS_BODY,
     SOURCE_INFO_FLAG_HAS_DEPTH,
+    SOURCE_INFO_FLAG_LOOP_EMITS_RESET,
     SOURCE_KIND_FINITE,
     SOURCE_KIND_LIVE,
     SOURCE_KIND_UNKNOWN,
-    MODULE_STATUS_OFFLINE,
-    MODULE_STATUS_ONLINE,
-    MODULE_STATUS_STREAM_RESET,
     RECORDING_FORMAT_MCAP,
     RECORDING_FORMAT_SVO,
     RECORDING_FORMAT_UNKNOWN,
@@ -117,32 +93,20 @@ _INSTANCE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,22})$")
 _NAMESPACE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,31})$")
 _UNIX_PATH_MAX = 107
 _FRAME_SUBSCRIPTION_PREFIX = bytes([FRAME_TOPIC_MAGIC])
-_CONTROL_RESPONSE_LABELS = {
-    CONTROL_RESPONSE_OK: "OK",
-    CONTROL_RESPONSE_UNKNOWN_CMD: "UNKNOWN_CMD",
-    CONTROL_RESPONSE_ERROR: "ERROR",
-    CONTROL_RESPONSE_INVALID_MAGIC: "INVALID_MAGIC",
-    CONTROL_RESPONSE_INVALID_LABEL: "INVALID_LABEL",
-    CONTROL_RESPONSE_INVALID_VERSION: "INVALID_VERSION",
-    CONTROL_RESPONSE_INVALID_MSG_SIZE: "INVALID_MSG_SIZE",
-    CONTROL_RESPONSE_UNSUPPORTED: "UNSUPPORTED",
-    CONTROL_RESPONSE_INVALID_PAYLOAD: "INVALID_PAYLOAD",
-    CONTROL_RESPONSE_OUT_OF_RANGE: "OUT_OF_RANGE",
-    CONTROL_RESPONSE_TIMEOUT: "TIMEOUT",
-}
-_PROTO_TO_CONTROL_ERROR = {
-    control_pb2.ERROR_CODE_OK: CONTROL_RESPONSE_OK,
-    control_pb2.ERROR_CODE_UNKNOWN_CMD: CONTROL_RESPONSE_UNKNOWN_CMD,
-    control_pb2.ERROR_CODE_ERROR: CONTROL_RESPONSE_ERROR,
-    control_pb2.ERROR_CODE_UNSUPPORTED: CONTROL_RESPONSE_UNSUPPORTED,
-    control_pb2.ERROR_CODE_INVALID_PAYLOAD: CONTROL_RESPONSE_INVALID_PAYLOAD,
-    control_pb2.ERROR_CODE_OUT_OF_RANGE: CONTROL_RESPONSE_OUT_OF_RANGE,
-    control_pb2.ERROR_CODE_TIMEOUT: CONTROL_RESPONSE_TIMEOUT,
+_PROTO_TO_CONTROL_ERROR_CODE = {
+    control_pb2.ERROR_CODE_OK: ControlErrorCode.OK,
+    control_pb2.ERROR_CODE_UNKNOWN_CMD: ControlErrorCode.UNKNOWN_CMD,
+    control_pb2.ERROR_CODE_ERROR: ControlErrorCode.ERROR,
+    control_pb2.ERROR_CODE_UNSUPPORTED: ControlErrorCode.UNSUPPORTED,
+    control_pb2.ERROR_CODE_INVALID_PAYLOAD: ControlErrorCode.INVALID_PAYLOAD,
+    control_pb2.ERROR_CODE_OUT_OF_RANGE: ControlErrorCode.OUT_OF_RANGE,
+    control_pb2.ERROR_CODE_TIMEOUT: ControlErrorCode.TIMEOUT,
 }
 _PROTO_TO_MODULE_STATUS = {
-    control_pb2.MODULE_STATUS_CODE_ONLINE: MODULE_STATUS_ONLINE,
-    control_pb2.MODULE_STATUS_CODE_OFFLINE: MODULE_STATUS_OFFLINE,
-    control_pb2.MODULE_STATUS_CODE_STREAM_RESET: MODULE_STATUS_STREAM_RESET,
+    control_pb2.MODULE_STATUS_CODE_UNKNOWN: ModuleStatus.UNKNOWN,
+    control_pb2.MODULE_STATUS_CODE_ONLINE: ModuleStatus.ONLINE,
+    control_pb2.MODULE_STATUS_CODE_OFFLINE: ModuleStatus.OFFLINE,
+    control_pb2.MODULE_STATUS_CODE_STREAM_RESET: ModuleStatus.STREAM_RESET,
 }
 _DISCOVERY_SERVICE_NAME = "cvmmap_producer"
 _DISCOVERY_PING_SUBJECT = f"$SRV.PING.{_DISCOVERY_SERVICE_NAME}"
@@ -448,17 +412,18 @@ def _import_nats() -> Any:
     return importlib.import_module("nats")
 
 
-def _proto_error_to_control_code(error_code: int) -> int:
-    return _PROTO_TO_CONTROL_ERROR.get(error_code, CONTROL_RESPONSE_ERROR)
+def _proto_error_to_control_error_code(error_code: int) -> ControlErrorCode:
+    return _PROTO_TO_CONTROL_ERROR_CODE.get(error_code, ControlErrorCode.ERROR)
 
 
-def _format_control_failure(command_name: str, response_code: int) -> str:
-    label = _CONTROL_RESPONSE_LABELS.get(response_code, "UNKNOWN")
-    return f"{command_name} failed with {label} ({response_code})"
+def _format_control_failure(
+    command_name: str, error_code: ControlErrorCode
+) -> str:
+    return f"{command_name} failed with {error_code.name} ({int(error_code)})"
 
 
-def _module_status_from_proto(event: control_pb2.ModuleStatusEvent) -> int:
-    return _PROTO_TO_MODULE_STATUS.get(event.status, MODULE_STATUS_ONLINE)
+def _module_status_from_proto(event: control_pb2.ModuleStatusEvent) -> ModuleStatus:
+    return _PROTO_TO_MODULE_STATUS.get(event.status, ModuleStatus.UNKNOWN)
 
 
 def _recording_subject(
@@ -520,106 +485,6 @@ def _seek_result_from_pb(response: control_pb2.SeekTimestampResponse) -> SeekRes
         landed_frame_count=response.landed_frame_count,
         exact_match=response.exact_match,
     )
-
-
-def _legacy_control_response(
-    command_id: int,
-    response_code: int,
-    response_message: bytes = b"",
-) -> ControlMessageResponse:
-    return ControlMessageResponse(
-        command_id=command_id,
-        response_code=response_code,
-        label="",
-        response_message=response_message,
-    )
-
-
-def _marshal_source_info_payload(response: control_pb2.GetSourceInfoResponse) -> bytes:
-    return struct.pack(
-        SourceInfo.PACK_FMT,
-        SourceInfo.size(),
-        response.source_kind,
-        response.timestamp_domain,
-        response.flags,
-        response.timeline_start_ns,
-        response.timeline_end_ns,
-        response.duration_ns,
-        response.current_timestamp_ns,
-        response.current_frame_count,
-        0,
-    )
-
-
-def _marshal_seek_result_payload(
-    response: control_pb2.SeekTimestampResponse,
-) -> bytes:
-    return struct.pack(
-        SeekResult.PACK_FMT,
-        SeekResult.size(),
-        1 if response.exact_match else 0,
-        0,
-        response.requested_timestamp_ns,
-        response.landed_timestamp_ns,
-        response.landed_frame_count,
-        0,
-    )
-
-
-def _marshal_recording_status_payload(
-    response: control_pb2.RecordingStatusResponse,
-) -> bytes:
-    status = _recording_status_from_pb(response)
-    encoded_path = status.active_path.encode("utf-8")
-    return struct.pack(
-        RecordingStatus.PACK_FMT,
-        RecordingStatus.size(),
-        status.recording_format,
-        0,
-        status.flags,
-        len(encoded_path),
-        status.frames_ingested,
-        status.frames_encoded,
-        0,
-    ) + encoded_path
-
-
-def _parse_legacy_seek_request(payload: bytes) -> int:
-    if len(payload) < SeekTimestampRequest.size():
-        raise ValueError(
-            f"seek request payload too short: {len(payload)} < {SeekTimestampRequest.size()}"
-        )
-    struct_size, _reserved, target_timestamp_ns = struct.unpack(
-        SeekTimestampRequest.PACK_FMT,
-        payload[: SeekTimestampRequest.size()],
-    )
-    if struct_size < SeekTimestampRequest.size():
-        raise ValueError(
-            f"invalid seek request payload size: {struct_size} < {SeekTimestampRequest.size()}"
-        )
-    return int(target_timestamp_ns)
-
-
-def _parse_legacy_recording_start_request(payload: bytes) -> str:
-    if len(payload) < RecordingStartRequest.size():
-        raise ValueError(
-            "recording start payload too short: "
-            f"{len(payload)} < {RecordingStartRequest.size()}"
-        )
-    struct_size, _flags, path_length, _reserved = struct.unpack(
-        RecordingStartRequest.PACK_FMT,
-        payload[: RecordingStartRequest.size()],
-    )
-    if struct_size < RecordingStartRequest.size():
-        raise ValueError(
-            "invalid recording start payload size: "
-            f"{struct_size} < {RecordingStartRequest.size()}"
-        )
-
-    total_size = RecordingStartRequest.size() + path_length
-    if len(payload) < total_size:
-        raise ValueError(f"recording start path truncated: {len(payload)} < {total_size}")
-    return payload[RecordingStartRequest.size() : total_size].decode("utf-8")
 
 
 def _schedule_nats_close(client: Any | None) -> None:
@@ -816,7 +681,7 @@ class CvMmapClient(_NatsMixin):
         self._image_buffer = None
         self._shm = None
         self._nats = None
-        self._status_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._status_queue: asyncio.Queue[ModuleStatus] = asyncio.Queue()
         self._status_subscription_ready = False
 
     @property
@@ -953,8 +818,8 @@ class CvMmapClient(_NatsMixin):
                             await task
 
                 if status_task in done:
-                    status = int(status_task.result())
-                    if status in (MODULE_STATUS_OFFLINE, MODULE_STATUS_STREAM_RESET):
+                    status = status_task.result()
+                    if status == ModuleStatus.OFFLINE:
                         return
                     continue
 
@@ -1003,7 +868,7 @@ class CvMmapBodyStream(_NatsMixin):
         self._nats_url = nats_url
         self._nats = None
         self._body_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self._status_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._status_queue: asyncio.Queue[ModuleStatus] = asyncio.Queue()
         self._subscriptions_ready = False
 
     async def _ensure_subscriptions(self) -> None:
@@ -1053,8 +918,8 @@ class CvMmapBodyStream(_NatsMixin):
                         await task
 
             if status_task in done:
-                status = int(status_task.result())
-                if status in (MODULE_STATUS_OFFLINE, MODULE_STATUS_STREAM_RESET):
+                status = status_task.result()
+                if status == ModuleStatus.OFFLINE:
                     return
                 continue
 
@@ -1144,115 +1009,16 @@ class CvMmapRequestClient(_NatsMixin):
         response.ParseFromString(message.data)
         return response
 
-    async def send_request(
-        self,
-        command_id: int,
-        request_message: bytes = b"",
-        timeout_ms: int = 5000,
-    ) -> ControlMessageResponse:
-        if command_id == CONTROL_MSG_CMD_RESET_FRAME_COUNT:
-            response = await self._request_pb(
-                subject_control_source_reset(self._target_key),
-                control_pb2.ResetFrameCountRequest(),
-                control_pb2.ResetFrameCountResponse,
-                timeout_ms,
-            )
-            return _legacy_control_response(
-                command_id,
-                _proto_error_to_control_code(response.error),
-            )
-
-        if command_id == CONTROL_MSG_CMD_GET_SOURCE_INFO:
-            response = await self._request_pb(
-                subject_control_source_info(self._target_key),
-                control_pb2.GetSourceInfoRequest(),
-                control_pb2.GetSourceInfoResponse,
-                timeout_ms,
-            )
-            response_code = _proto_error_to_control_code(response.error)
-            payload = (
-                _marshal_source_info_payload(response)
-                if response_code == CONTROL_RESPONSE_OK
-                else b""
-            )
-            return _legacy_control_response(command_id, response_code, payload)
-
-        if command_id == CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS:
-            parsed = _parse_legacy_seek_request(request_message)
-            request = control_pb2.SeekTimestampRequest()
-            request.target_timestamp_ns = parsed
-            response = await self._request_pb(
-                subject_control_source_seek(self._target_key),
-                request,
-                control_pb2.SeekTimestampResponse,
-                timeout_ms,
-            )
-            response_code = _proto_error_to_control_code(response.error)
-            payload = (
-                _marshal_seek_result_payload(response)
-                if response_code == CONTROL_RESPONSE_OK
-                else b""
-            )
-            return _legacy_control_response(command_id, response_code, payload)
-
-        if command_id == CONTROL_MSG_CMD_START_RECORDING:
-            parsed = _parse_legacy_recording_start_request(request_message)
-            request = control_pb2.RecordingStartRequest()
-            request.output_path = parsed
-            response = await self._request_pb(
-                subject_control_recorder_svo_start(self._target_key),
-                request,
-                control_pb2.RecordingStatusResponse,
-                timeout_ms,
-            )
-            response_code = _proto_error_to_control_code(response.error)
-            payload = (
-                _marshal_recording_status_payload(response)
-                if response_code == CONTROL_RESPONSE_OK
-                else b""
-            )
-            return _legacy_control_response(command_id, response_code, payload)
-
-        if command_id == CONTROL_MSG_CMD_STOP_RECORDING:
-            response = await self._request_pb(
-                subject_control_recorder_svo_stop(self._target_key),
-                control_pb2.RecordingStopRequest(),
-                control_pb2.RecordingStatusResponse,
-                timeout_ms,
-            )
-            response_code = _proto_error_to_control_code(response.error)
-            payload = (
-                _marshal_recording_status_payload(response)
-                if response_code == CONTROL_RESPONSE_OK
-                else b""
-            )
-            return _legacy_control_response(command_id, response_code, payload)
-
-        if command_id == CONTROL_MSG_CMD_GET_RECORDING_STATUS:
-            response = await self._request_pb(
-                subject_control_recorder_svo_status(self._target_key),
-                control_pb2.RecordingStatusRequest(),
-                control_pb2.RecordingStatusResponse,
-                timeout_ms,
-            )
-            response_code = _proto_error_to_control_code(response.error)
-            payload = (
-                _marshal_recording_status_payload(response)
-                if response_code == CONTROL_RESPONSE_OK
-                else b""
-            )
-            return _legacy_control_response(command_id, response_code, payload)
-
-        return _legacy_control_response(command_id, CONTROL_RESPONSE_UNKNOWN_CMD)
-
-    async def reset_frame_count(self, timeout_ms: int = 5000) -> int:
+    async def reset_frame_count(
+        self, timeout_ms: int = 5000
+    ) -> ControlErrorCode:
         response = await self._request_pb(
             subject_control_source_reset(self._target_key),
             control_pb2.ResetFrameCountRequest(),
             control_pb2.ResetFrameCountResponse,
             timeout_ms,
         )
-        return _proto_error_to_control_code(response.error)
+        return _proto_error_to_control_error_code(response.error)
 
     async def get_source_info(self, timeout_ms: int = 5000) -> SourceInfo:
         response = await self._request_pb(
@@ -1265,7 +1031,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "GET_SOURCE_INFO",
-                    _proto_error_to_control_code(response.error),
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
         return _source_info_from_pb(response)
@@ -1287,7 +1053,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "SEEK_TIMESTAMP_NS",
-                    _proto_error_to_control_code(response.error),
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
         return _seek_result_from_pb(response)
@@ -1303,7 +1069,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "GET_CAPABILITIES",
-                    _proto_error_to_control_code(source_response.error),
+                    _proto_error_to_control_error_code(source_response.error),
                 )
             )
 
@@ -1408,7 +1174,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "START_RECORDING",
-                    _proto_error_to_control_code(response.error),
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
         return _recording_status_from_pb(response)
@@ -1432,7 +1198,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "STOP_RECORDING",
-                    _proto_error_to_control_code(response.error),
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
         return _recording_status_from_pb(response)
@@ -1456,7 +1222,7 @@ class CvMmapRequestClient(_NatsMixin):
             raise RuntimeError(
                 _format_control_failure(
                     "GET_RECORDING_STATUS",
-                    _proto_error_to_control_code(response.error),
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
         return _recording_status_from_pb(response)
@@ -1481,42 +1247,21 @@ __all__ = [
     "BodyTrack",
     "BodyTrackingMessageHeader",
     "ControlCapabilities",
-    "ControlMessageRequest",
-    "ControlMessageResponse",
+    "ControlErrorCode",
     "FrameInfo",
     "FrameMetadata",
     "FrameMetadataV2",
     "FrameMetadataV2Header",
     "FramePlaneDescriptorV2",
     "McapRecordingOptions",
-    "ModuleStatusMessage",
+    "ModuleStatus",
     "RecordingRequest",
-    "RecordingStartRequest",
     "RecordingStatus",
     "SeekResult",
-    "SeekTimestampRequest",
     "SourceInfo",
     "SvoRecordingOptions",
     "SyncMessage",
     "BODY_TRACKING_MAGIC",
-    "CONTROL_MSG_CMD_GENERIC",
-    "CONTROL_MSG_CMD_GET_RECORDING_STATUS",
-    "CONTROL_MSG_CMD_GET_SOURCE_INFO",
-    "CONTROL_MSG_CMD_RESET_FRAME_COUNT",
-    "CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS",
-    "CONTROL_MSG_CMD_START_RECORDING",
-    "CONTROL_MSG_CMD_STOP_RECORDING",
-    "CONTROL_RESPONSE_ERROR",
-    "CONTROL_RESPONSE_INVALID_LABEL",
-    "CONTROL_RESPONSE_INVALID_MAGIC",
-    "CONTROL_RESPONSE_INVALID_MSG_SIZE",
-    "CONTROL_RESPONSE_INVALID_PAYLOAD",
-    "CONTROL_RESPONSE_INVALID_VERSION",
-    "CONTROL_RESPONSE_OK",
-    "CONTROL_RESPONSE_OUT_OF_RANGE",
-    "CONTROL_RESPONSE_TIMEOUT",
-    "CONTROL_RESPONSE_UNKNOWN_CMD",
-    "CONTROL_RESPONSE_UNSUPPORTED",
     "CV_MMAP_MAGIC",
     "CV_MMAP_MAGIC_LEN",
     "DEFAULT_NATS_URL",
@@ -1525,9 +1270,6 @@ __all__ = [
     "DEPTH_UNIT_UNKNOWN",
     "FRAME_METADATA_REGION_SIZE",
     "FRAME_TOPIC_MAGIC",
-    "MODULE_STATUS_OFFLINE",
-    "MODULE_STATUS_ONLINE",
-    "MODULE_STATUS_STREAM_RESET",
     "RECORDING_FORMAT_MCAP",
     "RECORDING_FORMAT_SVO",
     "RECORDING_FORMAT_UNKNOWN",
@@ -1540,6 +1282,7 @@ __all__ = [
     "SOURCE_INFO_FLAG_CAN_SEEK",
     "SOURCE_INFO_FLAG_HAS_BODY",
     "SOURCE_INFO_FLAG_HAS_DEPTH",
+    "SOURCE_INFO_FLAG_LOOP_EMITS_RESET",
     "SOURCE_KIND_FINITE",
     "SOURCE_KIND_LIVE",
     "SOURCE_KIND_UNKNOWN",

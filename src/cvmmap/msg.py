@@ -1,5 +1,6 @@
 import struct
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Optional
 
 import numpy as np
@@ -8,42 +9,30 @@ import numpy as np
 LABEL_LEN_MAX = 24
 
 FRAME_TOPIC_MAGIC = 0x7D
-MODULE_STATUS_MAGIC = 0x5A
-
-CONTROL_MESSAGE_REQUEST_MAGIC = 0x3C
-CONTROL_MESSAGE_RESPONSE_MAGIC = 0x3D
 BODY_TRACKING_MAGIC = 0x62
-
-CONTROL_MSG_CMD_GENERIC = 0
-CONTROL_MSG_CMD_RESET_FRAME_COUNT = 0x1001
-CONTROL_MSG_CMD_GET_SOURCE_INFO = 0x1002
-CONTROL_MSG_CMD_SEEK_TIMESTAMP_NS = 0x1003
-CONTROL_MSG_CMD_START_RECORDING = 0x1004
-CONTROL_MSG_CMD_STOP_RECORDING = 0x1005
-CONTROL_MSG_CMD_GET_RECORDING_STATUS = 0x1006
-
-CONTROL_RESPONSE_OK = 0
-CONTROL_RESPONSE_UNKNOWN_CMD = -1
-CONTROL_RESPONSE_ERROR = -2
-CONTROL_RESPONSE_INVALID_MAGIC = -3
-CONTROL_RESPONSE_INVALID_LABEL = -4
-CONTROL_RESPONSE_INVALID_VERSION = -5
-CONTROL_RESPONSE_INVALID_MSG_SIZE = -6
-CONTROL_RESPONSE_UNSUPPORTED = -7
-CONTROL_RESPONSE_INVALID_PAYLOAD = -8
-CONTROL_RESPONSE_OUT_OF_RANGE = -9
-CONTROL_RESPONSE_TIMEOUT = -100
-CONTROL_RESPONSE_TIMEOUT = -100
-
-MODULE_STATUS_ONLINE = 0xA1
-MODULE_STATUS_OFFLINE = 0xA0
-MODULE_STATUS_STREAM_RESET = 0xB0
 
 VERSION_MAJOR = 1
 VERSION_MINOR = 0
 
 FRAME_METADATA_V1_MAJOR = 1
 FRAME_METADATA_V2_MAJOR = 2
+
+
+class ControlErrorCode(IntEnum):
+    OK = 0
+    UNKNOWN_CMD = 1
+    ERROR = 2
+    UNSUPPORTED = 3
+    INVALID_PAYLOAD = 4
+    OUT_OF_RANGE = 5
+    TIMEOUT = 6
+
+
+class ModuleStatus(IntEnum):
+    UNKNOWN = 0
+    ONLINE = 1
+    OFFLINE = 2
+    STREAM_RESET = 3
 
 SOURCE_KIND_UNKNOWN = 0
 SOURCE_KIND_LIVE = 1
@@ -58,10 +47,10 @@ SOURCE_INFO_FLAG_AUTO_LOOP = 0x00000002
 SOURCE_INFO_FLAG_HAS_DEPTH = 0x00000004
 SOURCE_INFO_FLAG_HAS_BODY = 0x00000008
 SOURCE_INFO_FLAG_CAN_RECORD = 0x00000010
+SOURCE_INFO_FLAG_LOOP_EMITS_RESET = 0x00000020
 
 RECORDING_FORMAT_UNKNOWN = 0
 RECORDING_FORMAT_SVO = 1
-RECORDING_FORMAT_MCAP = 2
 RECORDING_FORMAT_MCAP = 2
 
 RECORDING_STATUS_FLAG_CAN_RECORD = 0x0001
@@ -521,67 +510,6 @@ def unmarshal_body_tracking_message(data: bytes) -> BodyFrame:
         offset += BODY_TRACKING_BODY_RECORD_SIZE
 
     return BodyFrame(header=header, bodies=bodies)
-
-
-@dataclass
-class ModuleStatusMessage:
-    """
-    Module status message sent over ZMQ
-    """
-
-    module_status: int
-    label: str
-
-    # C++ struct layout:
-    # uint8_t _magic{MODULE_STATUS_MAGIC};      // offset 0
-    # uint8_t _reserved_0[1];                   // offset 1
-    # uint8_t versions_major{VERSION_MAJOR};    // offset 2
-    # uint8_t versions_minor{VERSION_MINOR};    // offset 3
-    # int32_t module_status;                    // offset 4
-    # uint8_t _label[LABEL_LEN_MAX];            // offset 8
-    # (Total: 32 bytes)
-    PACK_FMT = f"=BxBBi{LABEL_LEN_MAX}s"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(ModuleStatusMessage.PACK_FMT)
-
-    def marshal(self) -> bytes:
-        encoded_label = self.label.encode("utf-8")[:LABEL_LEN_MAX].ljust(
-            LABEL_LEN_MAX, b"\0"
-        )
-        return struct.pack(
-            self.PACK_FMT,
-            MODULE_STATUS_MAGIC,
-            VERSION_MAJOR,
-            VERSION_MINOR,
-            self.module_status,
-            encoded_label,
-        )
-
-    @staticmethod
-    def unmarshal(data: bytes) -> "ModuleStatusMessage":
-        if len(data) < ModuleStatusMessage.size():
-            raise ValueError(
-                f"Data too short: {len(data)} < {ModuleStatusMessage.size()}"
-            )
-
-        magic, v_major, v_minor, status, label_bytes = struct.unpack(
-            ModuleStatusMessage.PACK_FMT, data[: ModuleStatusMessage.size()]
-        )
-
-        if magic != MODULE_STATUS_MAGIC:
-            raise ValueError(
-                f"Invalid module status magic: expected {MODULE_STATUS_MAGIC:#x}, got {magic:#x}"
-            )
-
-        if v_major != VERSION_MAJOR:
-            raise ValueError(
-                f"Unsupported module status major version: expected {VERSION_MAJOR}, got {v_major}"
-            )
-
-        label = label_bytes.split(b"\0", 1)[0].decode("utf-8")
-        return ModuleStatusMessage(module_status=status, label=label)
 
 
 @dataclass
@@ -1151,12 +1079,6 @@ class SourceInfo:
     current_timestamp_ns: int
     current_frame_count: int
 
-    PACK_FMT = "<HBBIQQQQII"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(SourceInfo.PACK_FMT)
-
     @property
     def can_seek(self) -> bool:
         return (self.flags & SOURCE_INFO_FLAG_CAN_SEEK) != 0
@@ -1177,58 +1099,9 @@ class SourceInfo:
     def can_record(self) -> bool:
         return (self.flags & SOURCE_INFO_FLAG_CAN_RECORD) != 0
 
-    @staticmethod
-    def unmarshal(data: bytes) -> "SourceInfo":
-        if len(data) < SourceInfo.size():
-            raise ValueError(f"Data too short: {len(data)} < {SourceInfo.size()}")
-
-        (
-            struct_size,
-            source_kind,
-            timestamp_domain,
-            flags,
-            timeline_start_ns,
-            timeline_end_ns,
-            duration_ns,
-            current_timestamp_ns,
-            current_frame_count,
-            _reserved_0,
-        ) = struct.unpack(SourceInfo.PACK_FMT, data[: SourceInfo.size()])
-
-        if struct_size < SourceInfo.size():
-            raise ValueError(
-                f"Invalid source info payload size: {struct_size} < {SourceInfo.size()}"
-            )
-
-        return SourceInfo(
-            source_kind=source_kind,
-            timestamp_domain=timestamp_domain,
-            flags=flags,
-            timeline_start_ns=timeline_start_ns,
-            timeline_end_ns=timeline_end_ns,
-            duration_ns=duration_ns,
-            current_timestamp_ns=current_timestamp_ns,
-            current_frame_count=current_frame_count,
-        )
-
-
-@dataclass
-class SeekTimestampRequest:
-    target_timestamp_ns: int
-
-    PACK_FMT = "<HHQ"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(SeekTimestampRequest.PACK_FMT)
-
-    def marshal(self) -> bytes:
-        return struct.pack(
-            self.PACK_FMT,
-            self.size(),
-            0,
-            self.target_timestamp_ns,
-        )
+    @property
+    def loop_emits_reset(self) -> bool:
+        return (self.flags & SOURCE_INFO_FLAG_LOOP_EMITS_RESET) != 0
 
 
 @dataclass
@@ -1237,39 +1110,6 @@ class SeekResult:
     landed_timestamp_ns: int
     landed_frame_count: int
     exact_match: bool
-
-    PACK_FMT = "<HBBQQII"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(SeekResult.PACK_FMT)
-
-    @staticmethod
-    def unmarshal(data: bytes) -> "SeekResult":
-        if len(data) < SeekResult.size():
-            raise ValueError(f"Data too short: {len(data)} < {SeekResult.size()}")
-
-        (
-            struct_size,
-            exact_match,
-            _reserved_0,
-            requested_timestamp_ns,
-            landed_timestamp_ns,
-            landed_frame_count,
-            _reserved_1,
-        ) = struct.unpack(SeekResult.PACK_FMT, data[: SeekResult.size()])
-
-        if struct_size < SeekResult.size():
-            raise ValueError(
-                f"Invalid seek result payload size: {struct_size} < {SeekResult.size()}"
-            )
-
-        return SeekResult(
-            requested_timestamp_ns=requested_timestamp_ns,
-            landed_timestamp_ns=landed_timestamp_ns,
-            landed_frame_count=landed_frame_count,
-            exact_match=exact_match != 0,
-        )
 
 
 @dataclass
@@ -1307,36 +1147,6 @@ class RecordingRequest:
 
 
 @dataclass
-class RecordingStartRequest:
-    output_path: str
-    flags: int = 0
-
-    PACK_FMT = "<HHHH"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(RecordingStartRequest.PACK_FMT)
-
-    def marshal(self) -> bytes:
-        encoded_path = self.output_path.encode("utf-8")
-        if not encoded_path:
-            raise ValueError("output_path must not be empty")
-        if b"\0" in encoded_path:
-            raise ValueError("output_path must not contain NUL bytes")
-        if len(encoded_path) > 0xFFFF:
-            raise ValueError(
-                f"output_path too long for protocol payload: {len(encoded_path)} > 65535"
-            )
-        return struct.pack(
-            self.PACK_FMT,
-            self.size(),
-            self.flags,
-            len(encoded_path),
-            0,
-        ) + encoded_path
-
-
-@dataclass
 class RecordingStatus:
     recording_format: int
     flags: int
@@ -1344,13 +1154,6 @@ class RecordingStatus:
     frames_ingested: int
     frames_encoded: int
     error_message: str = ""
-    error_message: str = ""
-
-    PACK_FMT = "<HBBHHIII"
-
-    @staticmethod
-    def size() -> int:
-        return struct.calcsize(RecordingStatus.PACK_FMT)
 
     @property
     def can_record(self) -> bool:
@@ -1367,159 +1170,3 @@ class RecordingStatus:
     @property
     def last_frame_ok(self) -> bool:
         return (self.flags & RECORDING_STATUS_FLAG_LAST_FRAME_OK) != 0
-
-    @staticmethod
-    def unmarshal(data: bytes) -> "RecordingStatus":
-        if len(data) < RecordingStatus.size():
-            raise ValueError(
-                f"Data too short: {len(data)} < {RecordingStatus.size()}"
-            )
-
-        (
-            struct_size,
-            recording_format,
-            _reserved_0,
-            flags,
-            path_length,
-            frames_ingested,
-            frames_encoded,
-            _reserved_1,
-        ) = struct.unpack(RecordingStatus.PACK_FMT, data[: RecordingStatus.size()])
-
-        if struct_size < RecordingStatus.size():
-            raise ValueError(
-                "Invalid recording status payload size: "
-                f"{struct_size} < {RecordingStatus.size()}"
-            )
-
-        total_size = RecordingStatus.size() + path_length
-        if len(data) < total_size:
-            raise ValueError(
-                f"Data too short for recording status path: {len(data)} < {total_size}"
-            )
-
-        active_path = data[RecordingStatus.size() : total_size].decode("utf-8")
-        return RecordingStatus(
-            recording_format=recording_format,
-            flags=flags,
-            active_path=active_path,
-            frames_ingested=frames_ingested,
-            frames_encoded=frames_encoded,
-        )
-
-
-@dataclass
-class ControlMessageRequest:
-    """
-    Request message sent over ZMQ REQ socket
-    """
-
-    label: str
-    command_id: int
-    request_message: bytes
-
-    @staticmethod
-    def marshal_format() -> str:
-        # uint8_t _magic                            // offset 0
-        # uint8_t _reserved_0[1];                   // offset 1
-        # uint8_t versions_major                    // offset 2
-        # uint8_t versions_minor                    // offset 3
-        # int32_t command_id                        // offset 4
-        # uint8_t _label[LABEL_LEN_MAX]             // offset 8
-        # uint16_t request_message_length;          // offset 32
-        # (followed by variable length request message)
-        # Total wire header size: 34 bytes. The C++ struct is sizeof(...) == 36
-        # because of unsent trailing padding after the flexible-array length field.
-        return f"<BxBBi{LABEL_LEN_MAX}sH"
-
-    def marshal(self) -> bytes:
-        encoded_label = self.label.encode("utf-8")[:LABEL_LEN_MAX].ljust(
-            LABEL_LEN_MAX, b"\0"
-        )
-        msg_len = len(self.request_message)
-        header = struct.pack(
-            self.marshal_format(),
-            CONTROL_MESSAGE_REQUEST_MAGIC,
-            VERSION_MAJOR,
-            VERSION_MINOR,
-            self.command_id,
-            encoded_label,
-            msg_len,
-        )
-        return header + self.request_message
-
-    @staticmethod
-    def header_size() -> int:
-        return struct.calcsize(ControlMessageRequest.marshal_format())
-
-
-@dataclass
-class ControlMessageResponse:
-    """
-    Response message received over ZMQ REP socket
-    """
-
-    command_id: int
-    response_code: int
-    label: str
-    response_message: bytes
-
-    @staticmethod
-    def marshal_format() -> str:
-        # uint8_t _magic                            // offset 0
-        # uint8_t _reserved_0[1];                   // offset 1
-        # uint8_t versions_major                    // offset 2
-        # uint8_t versions_minor                    // offset 3
-        # int32_t command_id                        // offset 4
-        # int32_t response_code                     // offset 8
-        # uint8_t _label[LABEL_LEN_MAX];            // offset 12
-        # uint16_t response_message_length;         // offset 36
-        # Total wire header size: 38 bytes. The C++ struct is sizeof(...) == 40
-        # because of unsent trailing padding after the flexible-array length field.
-        return f"<BxBBii{LABEL_LEN_MAX}sH"
-
-    @staticmethod
-    def header_size() -> int:
-        return struct.calcsize(ControlMessageResponse.marshal_format())
-
-    @staticmethod
-    def unmarshal(data: bytes) -> "ControlMessageResponse":
-        if len(data) < ControlMessageResponse.header_size():
-            raise ValueError(
-                f"Data too short: {len(data)} < {ControlMessageResponse.header_size()}"
-            )
-
-        (magic, v_major, v_minor, command_id, response_code, label_bytes, msg_len) = (
-            struct.unpack(
-                ControlMessageResponse.marshal_format(),
-                data[: ControlMessageResponse.header_size()],
-            )
-        )
-
-        if magic != CONTROL_MESSAGE_RESPONSE_MAGIC:
-            raise ValueError(
-                f"Invalid response magic: expected {CONTROL_MESSAGE_RESPONSE_MAGIC:#x}, got {magic:#x}"
-            )
-
-        # Migration policy: control wire major remains v1 even when SHM metadata is v2.
-        # Keep minor-version leniency, but fail unsupported control majors deterministically.
-        if v_major != VERSION_MAJOR:
-            raise ValueError(
-                f"Unsupported control response major version: expected {VERSION_MAJOR}, got {v_major}"
-            )
-
-        label = label_bytes.split(b"\0", 1)[0].decode("utf-8")
-        total_size = ControlMessageResponse.header_size() + msg_len
-        if len(data) < total_size:
-            raise ValueError(f"Data too short for response payload: {len(data)} < {total_size}")
-        response_msg = data[
-            ControlMessageResponse.header_size() : ControlMessageResponse.header_size()
-            + msg_len
-        ]
-
-        return ControlMessageResponse(
-            command_id=command_id,
-            response_code=response_code,
-            label=label,
-            response_message=response_msg,
-        )
