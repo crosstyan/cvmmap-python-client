@@ -113,12 +113,12 @@ Discovered producers expose the advertised connect metadata through
 - `zmq_addr`
 - `body_subject`
 - `status_subject`
-- `control_subject_prefix`
+- `producer_subject_prefix`
 - `backend`
 
 Compatibility rules:
 
-- the existing live subjects `cvmmap.<target>.control.*`, `.body`, and `.status` remain unchanged
+- the existing live subjects `cvmmap.<target>.producer.*`, `.body`, and `.status` remain unchanged
 - discovery is additive and only helps clients find producers
 - existing manual target forms still work
 - producers with `nats.enabled = false` are not discoverable over NATS
@@ -218,30 +218,32 @@ The body stream and request client also accept a `DiscoveredProducer` object.
 ```python
 from cvmmap import (
     CvMmapRequestClient,
-    RecordingRequest,
+    SvoRecordingRequest,
+    SvoRecordingStatus,
     SvoRecordingOptions,
-    RECORDING_FORMAT_SVO,
 )
 
 client = CvMmapRequestClient("default")
 info = await client.get_source_info()
 print(info.source_kind, info.can_seek, info.can_record)
 
-caps = await client.get_capabilities()
-print(caps.can_seek, caps.available_recording_formats)
+source_caps = await client.get_source_capabilities()
+print(source_caps.can_seek)
+
+svo_caps = await client.get_svo_recording_capabilities()
+print(svo_caps.can_record)
 
 result = await client.seek_timestamp_ns(info.timeline_start_ns)
 print(result.landed_timestamp_ns, result.exact_match)
 
-status = await client.start_recording(
-    RecordingRequest(
-        recording_format=RECORDING_FORMAT_SVO,
+status: SvoRecordingStatus = await client.start_svo_recording(
+    SvoRecordingRequest(
         output_path="/tmp/example.svo2",
         svo_options=SvoRecordingOptions(compression_mode="h265"),
     )
 )
 print(status.is_recording, status.active_path)
 
-status = await client.stop_recording()
+status = await client.stop_svo_recording()
 print(status.is_recording, status.frames_encoded)
 ```

@@ -100,8 +100,8 @@ def _info_payload(
                 "backend": backend,
             },
             "endpoints": [
-                {"name": "source.info", "subject": f"cvmmap.{target_key}.control.source.info"},
-                {"name": "source.reset", "subject": f"cvmmap.{target_key}.control.source.reset"},
+                {"name": "source.info", "subject": f"cvmmap.{target_key}.producer.source.info"},
+                {"name": "source.reset", "subject": f"cvmmap.{target_key}.producer.source.reset"},
             ],
         }
     ).encode("utf-8")
@@ -143,10 +143,10 @@ def test_discover_cvmmap_producers_filters_and_fallback_subjects(monkeypatch) ->
         assert producer.nats_target_key == "cvmmap_zed4"
         assert producer.body_subject == "cvmmap.cvmmap_zed4.body"
         assert producer.status_subject == "cvmmap.cvmmap_zed4.status"
-        assert producer.control_subject_prefix == "cvmmap.cvmmap_zed4.control"
-        assert producer.control_subjects == (
-            "cvmmap.cvmmap_zed4.control.source.info",
-            "cvmmap.cvmmap_zed4.control.source.reset",
+        assert producer.producer_subject_prefix == "cvmmap.cvmmap_zed4.producer"
+        assert producer.producer_subjects == (
+            "cvmmap.cvmmap_zed4.producer.source.info",
+            "cvmmap.cvmmap_zed4.producer.source.reset",
         )
         assert fake_client.connected_servers == [cvmmap.DEFAULT_NATS_URL]
         assert fake_client.closed is True
@@ -213,9 +213,9 @@ def test_discovered_producer_constructors_preserve_connect_info() -> None:
         zmq_addr="ipc:///tmp/cvmmap_zed4",
         body_subject="cvmmap.cvmmap_zed4.body",
         status_subject="cvmmap.cvmmap_zed4.status",
-        control_subject_prefix="cvmmap.cvmmap_zed4.control",
+        producer_subject_prefix="cvmmap.cvmmap_zed4.producer",
         backend="zed",
-        control_subjects=("cvmmap.cvmmap_zed4.control.source.info",),
+        producer_subjects=("cvmmap.cvmmap_zed4.producer.source.info",),
     )
 
     frame_client = cvmmap.CvMmapClient(producer, nats_url=None)

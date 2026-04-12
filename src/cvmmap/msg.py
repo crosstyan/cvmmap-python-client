@@ -1113,12 +1113,8 @@ class SeekResult:
 
 
 @dataclass
-class ControlCapabilities:
+class SourceControlCapabilities:
     can_seek: bool
-    available_recording_formats: list[int]
-
-    def supports_recording_format(self, recording_format: int) -> bool:
-        return recording_format in self.available_recording_formats
 
 
 @dataclass
@@ -1130,43 +1126,23 @@ class SvoRecordingOptions:
 
 
 @dataclass
-class McapRecordingOptions:
-    compression: str | None = None
-    topic: str | None = None
-    depth_topic: str | None = None
-    body_topic: str | None = None
-    frame_id: str | None = None
+class SvoRecordingCapabilities:
+    can_record: bool
 
 
 @dataclass
-class RecordingRequest:
-    recording_format: int
+class SvoRecordingRequest:
     output_path: str
     svo_options: SvoRecordingOptions | None = None
-    mcap_options: McapRecordingOptions | None = None
 
 
 @dataclass
-class RecordingStatus:
-    recording_format: int
-    flags: int
+class SvoRecordingStatus:
+    can_record: bool
+    is_recording: bool
+    is_paused: bool
+    last_frame_ok: bool
     active_path: str
     frames_ingested: int
     frames_encoded: int
     error_message: str = ""
-
-    @property
-    def can_record(self) -> bool:
-        return (self.flags & RECORDING_STATUS_FLAG_CAN_RECORD) != 0
-
-    @property
-    def is_recording(self) -> bool:
-        return (self.flags & RECORDING_STATUS_FLAG_IS_RECORDING) != 0
-
-    @property
-    def is_paused(self) -> bool:
-        return (self.flags & RECORDING_STATUS_FLAG_IS_PAUSED) != 0
-
-    @property
-    def last_frame_ok(self) -> bool:
-        return (self.flags & RECORDING_STATUS_FLAG_LAST_FRAME_OK) != 0

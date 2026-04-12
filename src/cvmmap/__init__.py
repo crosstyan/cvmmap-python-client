@@ -19,69 +19,58 @@ Socket = _zmq_asyncio.Socket
 from . import control_pb2
 from .msg import (
     BODY_TRACKING_MAGIC,
-    ControlErrorCode,
-    CV_MMAP_MAGIC,
-    CV_MMAP_MAGIC_LEN,
-    DEPTH_UNIT_METER,
-    DEPTH_UNIT_MILLIMETER,
-    DEPTH_UNIT_UNKNOWN,
-    FRAME_METADATA_REGION_SIZE,
-    FRAME_TOPIC_MAGIC,
-    McapRecordingOptions,
     BodyFrame,
     BodyTrack,
     BodyTrackingMessageHeader,
-    ControlCapabilities,
+    CV_MMAP_MAGIC,
+    CV_MMAP_MAGIC_LEN,
+    ControlErrorCode,
+    DEPTH_UNIT_METER,
+    DEPTH_UNIT_MILLIMETER,
+    DEPTH_UNIT_UNKNOWN,
     FrameInfo,
     FrameMetadata,
+    FRAME_METADATA_REGION_SIZE,
+    FramePlaneDescriptorV2,
     FrameMetadataV2,
     FrameMetadataV2Header,
-    FramePlaneDescriptorV2,
+    FRAME_TOPIC_MAGIC,
     ModuleStatus,
-    RecordingRequest,
-    RecordingStatus,
     SeekResult,
     SourceInfo,
+    SourceControlCapabilities,
+    SvoRecordingCapabilities,
+    SvoRecordingRequest,
+    SvoRecordingStatus,
     SyncMessage,
     SvoRecordingOptions,
-    TIMESTAMP_DOMAIN_MEDIA_TIME_NS,
-    TIMESTAMP_DOMAIN_UNIX_EPOCH_NS,
-    TIMESTAMP_DOMAIN_UNKNOWN,
     SOURCE_INFO_FLAG_AUTO_LOOP,
-    SOURCE_INFO_FLAG_CAN_RECORD,
-    SOURCE_INFO_FLAG_CAN_SEEK,
     SOURCE_INFO_FLAG_HAS_BODY,
     SOURCE_INFO_FLAG_HAS_DEPTH,
     SOURCE_INFO_FLAG_LOOP_EMITS_RESET,
+    SOURCE_INFO_FLAG_CAN_RECORD,
+    SOURCE_INFO_FLAG_CAN_SEEK,
     SOURCE_KIND_FINITE,
     SOURCE_KIND_LIVE,
     SOURCE_KIND_UNKNOWN,
-    RECORDING_FORMAT_MCAP,
-    RECORDING_FORMAT_SVO,
-    RECORDING_FORMAT_UNKNOWN,
-    RECORDING_STATUS_FLAG_CAN_RECORD,
-    RECORDING_STATUS_FLAG_IS_PAUSED,
-    RECORDING_STATUS_FLAG_IS_RECORDING,
-    RECORDING_STATUS_FLAG_LAST_FRAME_OK,
+    TIMESTAMP_DOMAIN_MEDIA_TIME_NS,
+    TIMESTAMP_DOMAIN_UNIX_EPOCH_NS,
+    TIMESTAMP_DOMAIN_UNKNOWN,
     unmarshal_body_tracking_message,
     unmarshal_frame_metadata,
 )
 from .nats_subjects import (
     DEFAULT_NATS_URL,
     subject_body,
-    subject_control_prefix,
-    subject_control_recorder_mcap_capabilities,
-    subject_control_recorder_mcap_start,
-    subject_control_recorder_mcap_status,
-    subject_control_recorder_mcap_stop,
-    subject_control_recorder_svo_capabilities,
-    subject_control_recorder_svo_start,
-    subject_control_recorder_svo_status,
-    subject_control_recorder_svo_stop,
-    subject_control_source_capabilities,
-    subject_control_source_info,
-    subject_control_source_reset,
-    subject_control_source_seek,
+    subject_producer_prefix,
+    subject_producer_source_capabilities,
+    subject_producer_source_info,
+    subject_producer_source_reset,
+    subject_producer_source_seek,
+    subject_producer_svo_recorder_capabilities,
+    subject_producer_svo_recorder_start,
+    subject_producer_svo_recorder_status,
+    subject_producer_svo_recorder_stop,
     subject_status,
 )
 from .shm import SharedMemory
@@ -145,9 +134,9 @@ class DiscoveredProducer:
     zmq_addr: str = ""
     body_subject: str = ""
     status_subject: str = ""
-    control_subject_prefix: str = ""
+    producer_subject_prefix: str = ""
     backend: str = ""
-    control_subjects: tuple[str, ...] = ()
+    producer_subjects: tuple[str, ...] = ()
 
 
 class DiscoveryError(RuntimeError):
@@ -370,22 +359,22 @@ def _parse_discovered_producer(payload: bytes) -> DiscoveredProducer:
     if not isinstance(endpoints_raw, list):
         raise DiscoveryError("invalid discovery info payload: endpoints must be an array")
 
-    control_subjects: list[str] = []
+    producer_subjects: list[str] = []
     for endpoint in endpoints_raw:
         if not isinstance(endpoint, dict):
             continue
         subject = endpoint.get("subject")
         if isinstance(subject, str) and subject:
-            control_subjects.append(subject)
+            producer_subjects.append(subject)
 
-    control_subjects = sorted(set(control_subjects))
+    producer_subjects = sorted(set(producer_subjects))
     body_subject = _metadata_str(metadata, "body_subject") or subject_body(nats_target_key)
     status_subject = _metadata_str(metadata, "status_subject") or subject_status(
         nats_target_key
     )
-    control_prefix = _metadata_str(
-        metadata, "control_subject_prefix"
-    ) or subject_control_prefix(nats_target_key)
+    producer_prefix = _metadata_str(
+        metadata, "producer_subject_prefix"
+    ) or subject_producer_prefix(nats_target_key)
 
     return DiscoveredProducer(
         service_id=service_id,
@@ -402,9 +391,9 @@ def _parse_discovered_producer(payload: bytes) -> DiscoveredProducer:
         zmq_addr=zmq_addr,
         body_subject=body_subject,
         status_subject=status_subject,
-        control_subject_prefix=control_prefix,
+        producer_subject_prefix=producer_prefix,
         backend=_metadata_str(metadata, "backend"),
-        control_subjects=tuple(control_subjects),
+        producer_subjects=tuple(producer_subjects),
     )
 
 
@@ -426,38 +415,14 @@ def _module_status_from_proto(event: control_pb2.ModuleStatusEvent) -> ModuleSta
     return _PROTO_TO_MODULE_STATUS.get(event.status, ModuleStatus.UNKNOWN)
 
 
-def _recording_subject(
-    recording_format: int,
-    *,
-    svo_subject: str,
-    mcap_subject: str,
-) -> str:
-    if recording_format == RECORDING_FORMAT_SVO:
-        return svo_subject
-    if recording_format == RECORDING_FORMAT_MCAP:
-        return mcap_subject
-    raise ValueError("recording_format is required")
-
-
-def _recording_flags_from_pb(response: control_pb2.RecordingStatusResponse) -> int:
-    flags = 0
-    if response.can_record:
-        flags |= RECORDING_STATUS_FLAG_CAN_RECORD
-    if response.is_recording:
-        flags |= RECORDING_STATUS_FLAG_IS_RECORDING
-    if response.is_paused:
-        flags |= RECORDING_STATUS_FLAG_IS_PAUSED
-    if response.last_frame_ok:
-        flags |= RECORDING_STATUS_FLAG_LAST_FRAME_OK
-    return flags
-
-
-def _recording_status_from_pb(
+def _svo_recording_status_from_pb(
     response: control_pb2.RecordingStatusResponse,
-) -> RecordingStatus:
-    return RecordingStatus(
-        recording_format=response.format,
-        flags=_recording_flags_from_pb(response),
+) -> SvoRecordingStatus:
+    return SvoRecordingStatus(
+        can_record=response.can_record,
+        is_recording=response.is_recording,
+        is_paused=response.is_paused,
+        last_frame_ok=response.last_frame_ok,
         active_path=response.active_path,
         frames_ingested=response.frames_ingested,
         frames_encoded=response.frames_encoded,
@@ -1013,7 +978,7 @@ class CvMmapRequestClient(_NatsMixin):
         self, timeout_ms: int = 5000
     ) -> ControlErrorCode:
         response = await self._request_pb(
-            subject_control_source_reset(self._target_key),
+            subject_producer_source_reset(self._target_key),
             control_pb2.ResetFrameCountRequest(),
             control_pb2.ResetFrameCountResponse,
             timeout_ms,
@@ -1022,7 +987,7 @@ class CvMmapRequestClient(_NatsMixin):
 
     async def get_source_info(self, timeout_ms: int = 5000) -> SourceInfo:
         response = await self._request_pb(
-            subject_control_source_info(self._target_key),
+            subject_producer_source_info(self._target_key),
             control_pb2.GetSourceInfoRequest(),
             control_pb2.GetSourceInfoResponse,
             timeout_ms,
@@ -1044,7 +1009,7 @@ class CvMmapRequestClient(_NatsMixin):
         request = control_pb2.SeekTimestampRequest()
         request.target_timestamp_ns = target_timestamp_ns
         response = await self._request_pb(
-            subject_control_source_seek(self._target_key),
+            subject_producer_source_seek(self._target_key),
             request,
             control_pb2.SeekTimestampResponse,
             timeout_ms,
@@ -1058,64 +1023,52 @@ class CvMmapRequestClient(_NatsMixin):
             )
         return _seek_result_from_pb(response)
 
-    async def get_capabilities(self, timeout_ms: int = 5000) -> ControlCapabilities:
-        source_response = await self._request_pb(
-            subject_control_source_capabilities(self._target_key),
+    async def get_source_capabilities(
+        self, timeout_ms: int = 5000
+    ) -> SourceControlCapabilities:
+        response = await self._request_pb(
+            subject_producer_source_capabilities(self._target_key),
             control_pb2.CapabilitiesRequest(),
             control_pb2.CapabilitiesResponse,
             timeout_ms,
         )
-        if source_response.error != control_pb2.ERROR_CODE_OK:
+        if response.error != control_pb2.ERROR_CODE_OK:
             raise RuntimeError(
                 _format_control_failure(
-                    "GET_CAPABILITIES",
-                    _proto_error_to_control_error_code(source_response.error),
+                    "GET_SOURCE_CAPABILITIES",
+                    _proto_error_to_control_error_code(response.error),
                 )
             )
+        return SourceControlCapabilities(can_seek=response.can_seek)
 
-        capabilities = ControlCapabilities(
-            can_seek=source_response.can_seek,
-            available_recording_formats=list(source_response.available_recording_formats),
+    async def get_svo_recording_capabilities(
+        self, timeout_ms: int = 5000
+    ) -> SvoRecordingCapabilities:
+        response = await self._request_pb(
+            subject_producer_svo_recorder_capabilities(self._target_key),
+            control_pb2.CapabilitiesRequest(),
+            control_pb2.CapabilitiesResponse,
+            timeout_ms,
         )
-
-        async def _merge_recorder(subject: str) -> None:
-            try:
-                response = await self._request_pb(
-                    subject,
-                    control_pb2.CapabilitiesRequest(),
-                    control_pb2.CapabilitiesResponse,
-                    timeout_ms,
+        if response.error != control_pb2.ERROR_CODE_OK:
+            raise RuntimeError(
+                _format_control_failure(
+                    "GET_SVO_RECORDING_CAPABILITIES",
+                    _proto_error_to_control_error_code(response.error),
                 )
-            except TimeoutError:
-                return
-            except RuntimeError:
-                return
-
-            if response.error != control_pb2.ERROR_CODE_OK:
-                return
-
-            for recording_format in response.available_recording_formats:
-                if not capabilities.supports_recording_format(recording_format):
-                    capabilities.available_recording_formats.append(recording_format)
-
-        await _merge_recorder(
-            subject_control_recorder_svo_capabilities(self._target_key)
+            )
+        return SvoRecordingCapabilities(
+            can_record=control_pb2.RECORDING_FORMAT_SVO
+            in response.available_recording_formats
         )
-        await _merge_recorder(
-            subject_control_recorder_mcap_capabilities(self._target_key)
-        )
-        return capabilities
 
-    async def start_recording(
+    async def start_svo_recording(
         self,
-        request_or_output_path: RecordingRequest | str,
+        request_or_output_path: SvoRecordingRequest | str,
         timeout_ms: int = 5000,
-    ) -> RecordingStatus:
+    ) -> SvoRecordingStatus:
         if isinstance(request_or_output_path, str):
-            request_model = RecordingRequest(
-                recording_format=RECORDING_FORMAT_SVO,
-                output_path=request_or_output_path,
-            )
+            request_model = SvoRecordingRequest(output_path=request_or_output_path)
         else:
             request_model = request_or_output_path
 
@@ -1125,47 +1078,21 @@ class CvMmapRequestClient(_NatsMixin):
         request = control_pb2.RecordingStartRequest()
         request.output_path = request_model.output_path
 
-        if request_model.recording_format == RECORDING_FORMAT_SVO:
-            if request_model.mcap_options is not None:
-                raise ValueError("MCAP options are invalid for SVO recording")
-            if request_model.svo_options is not None:
-                options = request.svo_options
-                if request_model.svo_options.compression_mode is not None:
-                    options.compression_mode = request_model.svo_options.compression_mode
-                if request_model.svo_options.bitrate is not None:
-                    options.bitrate = request_model.svo_options.bitrate
-                if request_model.svo_options.target_framerate is not None:
-                    options.target_framerate = (
-                        request_model.svo_options.target_framerate
-                    )
-                if request_model.svo_options.transcode_streaming_input is not None:
-                    options.transcode_streaming_input = (
-                        request_model.svo_options.transcode_streaming_input
-                    )
-        elif request_model.recording_format == RECORDING_FORMAT_MCAP:
-            if request_model.svo_options is not None:
-                raise ValueError("SVO options are invalid for MCAP recording")
-            if request_model.mcap_options is not None:
-                options = request.mcap_options
-                if request_model.mcap_options.compression is not None:
-                    options.compression = request_model.mcap_options.compression
-                if request_model.mcap_options.topic is not None:
-                    options.topic = request_model.mcap_options.topic
-                if request_model.mcap_options.depth_topic is not None:
-                    options.depth_topic = request_model.mcap_options.depth_topic
-                if request_model.mcap_options.body_topic is not None:
-                    options.body_topic = request_model.mcap_options.body_topic
-                if request_model.mcap_options.frame_id is not None:
-                    options.frame_id = request_model.mcap_options.frame_id
-        else:
-            raise ValueError("recording_format is required")
+        if request_model.svo_options is not None:
+            options = request.svo_options
+            if request_model.svo_options.compression_mode is not None:
+                options.compression_mode = request_model.svo_options.compression_mode
+            if request_model.svo_options.bitrate is not None:
+                options.bitrate = request_model.svo_options.bitrate
+            if request_model.svo_options.target_framerate is not None:
+                options.target_framerate = request_model.svo_options.target_framerate
+            if request_model.svo_options.transcode_streaming_input is not None:
+                options.transcode_streaming_input = (
+                    request_model.svo_options.transcode_streaming_input
+                )
 
         response = await self._request_pb(
-            _recording_subject(
-                request_model.recording_format,
-                svo_subject=subject_control_recorder_svo_start(self._target_key),
-                mcap_subject=subject_control_recorder_mcap_start(self._target_key),
-            ),
+            subject_producer_svo_recorder_start(self._target_key),
             request,
             control_pb2.RecordingStatusResponse,
             timeout_ms,
@@ -1173,23 +1100,15 @@ class CvMmapRequestClient(_NatsMixin):
         if response.error != control_pb2.ERROR_CODE_OK:
             raise RuntimeError(
                 _format_control_failure(
-                    "START_RECORDING",
+                    "START_SVO_RECORDING",
                     _proto_error_to_control_error_code(response.error),
                 )
             )
-        return _recording_status_from_pb(response)
+        return _svo_recording_status_from_pb(response)
 
-    async def stop_recording(
-        self,
-        recording_format: int = RECORDING_FORMAT_SVO,
-        timeout_ms: int = 5000,
-    ) -> RecordingStatus:
+    async def stop_svo_recording(self, timeout_ms: int = 5000) -> SvoRecordingStatus:
         response = await self._request_pb(
-            _recording_subject(
-                recording_format,
-                svo_subject=subject_control_recorder_svo_stop(self._target_key),
-                mcap_subject=subject_control_recorder_mcap_stop(self._target_key),
-            ),
+            subject_producer_svo_recorder_stop(self._target_key),
             control_pb2.RecordingStopRequest(),
             control_pb2.RecordingStatusResponse,
             timeout_ms,
@@ -1197,23 +1116,17 @@ class CvMmapRequestClient(_NatsMixin):
         if response.error != control_pb2.ERROR_CODE_OK:
             raise RuntimeError(
                 _format_control_failure(
-                    "STOP_RECORDING",
+                    "STOP_SVO_RECORDING",
                     _proto_error_to_control_error_code(response.error),
                 )
             )
-        return _recording_status_from_pb(response)
+        return _svo_recording_status_from_pb(response)
 
-    async def get_recording_status(
-        self,
-        recording_format: int = RECORDING_FORMAT_SVO,
-        timeout_ms: int = 5000,
-    ) -> RecordingStatus:
+    async def get_svo_recording_status(
+        self, timeout_ms: int = 5000
+    ) -> SvoRecordingStatus:
         response = await self._request_pb(
-            _recording_subject(
-                recording_format,
-                svo_subject=subject_control_recorder_svo_status(self._target_key),
-                mcap_subject=subject_control_recorder_mcap_status(self._target_key),
-            ),
+            subject_producer_svo_recorder_status(self._target_key),
             control_pb2.RecordingStatusRequest(),
             control_pb2.RecordingStatusResponse,
             timeout_ms,
@@ -1221,11 +1134,11 @@ class CvMmapRequestClient(_NatsMixin):
         if response.error != control_pb2.ERROR_CODE_OK:
             raise RuntimeError(
                 _format_control_failure(
-                    "GET_RECORDING_STATUS",
+                    "GET_SVO_RECORDING_STATUS",
                     _proto_error_to_control_error_code(response.error),
                 )
             )
-        return _recording_status_from_pb(response)
+        return _svo_recording_status_from_pb(response)
 
     def close(self) -> None:
         self._close_nats()
@@ -1246,19 +1159,19 @@ __all__ = [
     "BodyFrame",
     "BodyTrack",
     "BodyTrackingMessageHeader",
-    "ControlCapabilities",
     "ControlErrorCode",
     "FrameInfo",
     "FrameMetadata",
     "FrameMetadataV2",
     "FrameMetadataV2Header",
     "FramePlaneDescriptorV2",
-    "McapRecordingOptions",
     "ModuleStatus",
-    "RecordingRequest",
-    "RecordingStatus",
     "SeekResult",
     "SourceInfo",
+    "SourceControlCapabilities",
+    "SvoRecordingCapabilities",
+    "SvoRecordingRequest",
+    "SvoRecordingStatus",
     "SvoRecordingOptions",
     "SyncMessage",
     "BODY_TRACKING_MAGIC",
@@ -1270,13 +1183,6 @@ __all__ = [
     "DEPTH_UNIT_UNKNOWN",
     "FRAME_METADATA_REGION_SIZE",
     "FRAME_TOPIC_MAGIC",
-    "RECORDING_FORMAT_MCAP",
-    "RECORDING_FORMAT_SVO",
-    "RECORDING_FORMAT_UNKNOWN",
-    "RECORDING_STATUS_FLAG_CAN_RECORD",
-    "RECORDING_STATUS_FLAG_IS_PAUSED",
-    "RECORDING_STATUS_FLAG_IS_RECORDING",
-    "RECORDING_STATUS_FLAG_LAST_FRAME_OK",
     "SOURCE_INFO_FLAG_AUTO_LOOP",
     "SOURCE_INFO_FLAG_CAN_RECORD",
     "SOURCE_INFO_FLAG_CAN_SEEK",

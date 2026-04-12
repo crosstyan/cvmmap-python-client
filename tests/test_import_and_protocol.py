@@ -109,6 +109,10 @@ def test_import_core_symbols() -> None:
     assert getattr(cvmmap, "ModuleStatus") is not None
     assert getattr(cvmmap, "FrameInfo") is not None
     assert getattr(cvmmap, "DiscoveredProducer") is not None
+    assert getattr(cvmmap, "SourceControlCapabilities") is not None
+    assert getattr(cvmmap, "SvoRecordingCapabilities") is not None
+    assert getattr(cvmmap, "SvoRecordingRequest") is not None
+    assert getattr(cvmmap, "SvoRecordingStatus") is not None
     assert getattr(cvmmap, "discover_cvmmap_producers") is not None
 
 
@@ -155,19 +159,30 @@ def test_module_status_values() -> None:
 
 def test_removed_legacy_control_exports() -> None:
     removed_top_level = [
+        "ControlCapabilities",
         "ControlMessageRequest",
+        "McapRecordingOptions",
         "ControlMessageResponse",
         "ModuleStatusMessage",
         "RecordingStartRequest",
+        "RecordingRequest",
+        "RecordingStatus",
         "SeekTimestampRequest",
         "CONTROL_MSG_CMD_GET_SOURCE_INFO",
         "CONTROL_RESPONSE_OK",
         "MODULE_STATUS_STREAM_RESET",
+        "RECORDING_FORMAT_SVO",
+        "RECORDING_FORMAT_MCAP",
+        "RECORDING_FORMAT_UNKNOWN",
     ]
     for name in removed_top_level:
         assert not hasattr(cvmmap, name)
 
     assert not hasattr(cvmmap.CvMmapRequestClient, "send_request")
+    assert not hasattr(cvmmap.CvMmapRequestClient, "get_capabilities")
+    assert not hasattr(cvmmap.CvMmapRequestClient, "start_recording")
+    assert not hasattr(cvmmap.CvMmapRequestClient, "stop_recording")
+    assert not hasattr(cvmmap.CvMmapRequestClient, "get_recording_status")
 
     removed_msg_symbols = [
         "ControlMessageRequest",
@@ -231,20 +246,24 @@ def test_seek_result_model() -> None:
     assert result.exact_match is True
 
 
-def test_recording_status_properties() -> None:
-    status = cvmmap.RecordingStatus(
-        recording_format=cvmmap.RECORDING_FORMAT_SVO,
-        flags=(
-            cvmmap.RECORDING_STATUS_FLAG_CAN_RECORD
-            | cvmmap.RECORDING_STATUS_FLAG_IS_RECORDING
-            | cvmmap.RECORDING_STATUS_FLAG_LAST_FRAME_OK
-        ),
+def test_source_and_svo_capability_models() -> None:
+    source_caps = cvmmap.SourceControlCapabilities(can_seek=True)
+    svo_caps = cvmmap.SvoRecordingCapabilities(can_record=True)
+    assert source_caps.can_seek is True
+    assert svo_caps.can_record is True
+
+
+def test_svo_recording_status_properties() -> None:
+    status = cvmmap.SvoRecordingStatus(
+        can_record=True,
+        is_recording=True,
+        is_paused=False,
+        last_frame_ok=True,
         active_path="/tmp/example.svo2",
         frames_ingested=42,
         frames_encoded=40,
     )
 
-    assert status.recording_format == cvmmap.RECORDING_FORMAT_SVO
     assert status.can_record is True
     assert status.is_recording is True
     assert status.is_paused is False
@@ -291,7 +310,7 @@ def test_request_client_reset_frame_count_returns_enum() -> None:
             response_type,
             timeout_ms: int,
         ):
-            assert subject == "cvmmap.cvmmap_example.control.source.reset"
+            assert subject == "cvmmap.cvmmap_example.producer.source.reset"
             assert timeout_ms == 5000
             response = response_type()
             response.error = control_pb2.ERROR_CODE_TIMEOUT
@@ -359,19 +378,19 @@ def test_request_client_source_and_seek_methods() -> None:
     asyncio.run(_run())
 
 
-def test_request_client_start_recording_rejects_empty_path() -> None:
+def test_request_client_start_svo_recording_rejects_empty_path() -> None:
     async def _run() -> None:
         client = object.__new__(cvmmap.CvMmapRequestClient)
         client._target_key = "cvmmap_example"  # type: ignore[attr-defined]
         client._nats = None  # type: ignore[attr-defined]
 
         with pytest.raises(ValueError, match="output_path must not be empty"):
-            await client.start_recording("")
+            await client.start_svo_recording("")
 
     asyncio.run(_run())
 
 
-def test_request_client_recording_methods() -> None:
+def test_request_client_svo_recording_methods() -> None:
     async def _run() -> None:
         client = object.__new__(cvmmap.CvMmapRequestClient)
         client._target_key = "cvmmap_example"  # type: ignore[attr-defined]
@@ -385,11 +404,10 @@ def test_request_client_recording_methods() -> None:
         ):
             assert timeout_ms == 5000
             if subject.endswith(".start"):
-                assert subject == "cvmmap.cvmmap_example.control.recorder.svo.start"
+                assert subject == "cvmmap.cvmmap_example.producer.recorder.svo.start"
                 assert request_message.output_path == "/tmp/test.svo2"
             response = response_type()
             response.error = control_pb2.ERROR_CODE_OK
-            response.format = control_pb2.RECORDING_FORMAT_SVO
             response.can_record = True
             response.is_recording = True
             response.frames_ingested = 10
@@ -399,14 +417,14 @@ def test_request_client_recording_methods() -> None:
 
         client._request_pb = _ok_request_pb  # type: ignore[method-assign]
 
-        started = await client.start_recording("/tmp/test.svo2")
+        started = await client.start_svo_recording("/tmp/test.svo2")
         assert started.is_recording is True
         assert started.active_path == "/tmp/test.svo2"
 
-        stopped = await client.stop_recording()
+        stopped = await client.stop_svo_recording()
         assert stopped.frames_ingested == 10
 
-        status = await client.get_recording_status()
+        status = await client.get_svo_recording_status()
         assert status.frames_encoded == 9
 
         async def _error_request_pb(
@@ -421,16 +439,16 @@ def test_request_client_recording_methods() -> None:
 
         client._request_pb = _error_request_pb  # type: ignore[method-assign]
         try:
-            await client.get_recording_status()
+            await client.get_svo_recording_status()
         except RuntimeError as exc:
-            assert "GET_RECORDING_STATUS failed with UNSUPPORTED (3)" == str(exc)
+            assert "GET_SVO_RECORDING_STATUS failed with UNSUPPORTED (3)" == str(exc)
         else:
-            raise AssertionError("Expected get_recording_status() to raise")
+            raise AssertionError("Expected get_svo_recording_status() to raise")
 
     asyncio.run(_run())
 
 
-def test_request_client_capabilities_merge() -> None:
+def test_request_client_source_and_svo_capabilities() -> None:
     async def _run() -> None:
         client = object.__new__(cvmmap.CvMmapRequestClient)
         client._target_key = "cvmmap_example"  # type: ignore[attr-defined]
@@ -450,22 +468,15 @@ def test_request_client_capabilities_merge() -> None:
                 response.available_recording_formats.append(
                     control_pb2.RECORDING_FORMAT_SVO
                 )
-            elif subject.endswith(".recorder.mcap.capabilities"):
-                response.available_recording_formats.append(
-                    control_pb2.RECORDING_FORMAT_MCAP
-                )
             return response
 
         client._request_pb = _request_pb  # type: ignore[method-assign]
 
-        capabilities = await client.get_capabilities()
-        assert capabilities.can_seek is False
-        assert capabilities.available_recording_formats == [
-            cvmmap.RECORDING_FORMAT_SVO,
-            cvmmap.RECORDING_FORMAT_MCAP,
-        ]
-        assert capabilities.supports_recording_format(cvmmap.RECORDING_FORMAT_SVO)
-        assert capabilities.supports_recording_format(cvmmap.RECORDING_FORMAT_MCAP)
+        source_capabilities = await client.get_source_capabilities()
+        assert source_capabilities.can_seek is False
+
+        svo_capabilities = await client.get_svo_recording_capabilities()
+        assert svo_capabilities.can_record is True
 
     asyncio.run(_run())
 
